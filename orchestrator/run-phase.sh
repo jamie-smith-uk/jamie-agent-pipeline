@@ -90,6 +90,23 @@ run_agent() {
     halt "Agent invocation failed (exit $exit_code)" "$agent_id" "$(cat "$output_file")"
   fi
 
+  # Opportunistic token cost capture — records if opencode emits usage data.
+  # Format varies by opencode version; extend this pattern as needed.
+  local usage_line
+  usage_line=$(grep -iE "tokens?[: ]+[0-9]|input[_: ]+[0-9]+.*output[_: ]+[0-9]+" \
+    "$output_file" 2>/dev/null | tail -1 || true)
+  if [ -n "$usage_line" ] && [ -f "$PIPELINE_DIR/metrics.json" ]; then
+    python3 -c "
+import json, sys, re
+f, agent, usage = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(f))
+token_log = data.setdefault('token_log', [])
+token_log.append({'agent': agent, 'usage': usage})
+with open(f, 'w') as fp:
+    json.dump(data, fp, indent=2)
+" "$PIPELINE_DIR/metrics.json" "$agent_id" "$usage_line" 2>/dev/null || true
+  fi
+
   log "[$agent_id] Complete"
 }
 
@@ -150,7 +167,7 @@ print('*(Earlier tasks omitted — see context.md for full history)*\n\n' + tail
 " <<< "$content")
   fi
 
-  printf "## Context from completed tasks in this phase\n\n%s\n" "$content"
+  printf "<build-context>\n## Context from completed tasks in this phase\n\n%s\n</build-context>\n" "$content"
 }
 
 # Appends one phase entry to pipeline/phase-N/metrics.json (creates file if absent).
@@ -989,7 +1006,9 @@ Use process.env.DATABASE_URL for any database connections — do not read .env d
 
 ## Previous attempt failed the hard gate — fix every item below before marking done:
 
-$GATE_FAILURES"
+<gate-failures>
+$GATE_FAILURES
+</gate-failures>"
       fi
 
       run_agent "ag-04-developer" "$DEV_PROMPT" "$TASK_DIR/dev-output-$DEV_ATTEMPTS.md"
@@ -1197,7 +1216,9 @@ Return PASS or FAIL with specific findings."
 
 The Security Agent has rejected task $TASK_ID. Fix every finding below.
 
+<security-findings>
 $(cat "$SEC_REPORT")
+</security-findings>
 
 Task spec for context:
 $TASK_SPEC
