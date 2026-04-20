@@ -75,7 +75,7 @@ echo "  Source:   $PIPELINE_REPO"
 echo "  Target:   $TARGET"
 echo ""
 echo "Will update:"
-echo "  agents/*.md              → target/agents/ and target/.opencode/agents/"
+echo "  .opencode/agents/*.md    → target/.opencode/agents/"
 echo "  .opencode/config.json    → target/.opencode/config.json"
 echo "  .opencode/rules/*.md     → target/.opencode/rules/"
 echo "  orchestrator/*.sh        → target/orchestrator/ (executable)"
@@ -98,13 +98,12 @@ echo ""
 
 # ── Sync agent files ──────────────────────────────────────────────────────────
 log "Syncing agent files..."
-mkdir -p "$TARGET/agents" "$TARGET/.opencode/agents"
+mkdir -p "$TARGET/.opencode/agents"
 
-for f in "$PIPELINE_REPO"/agents/*.md; do
+for f in "$PIPELINE_REPO"/.opencode/agents/*.md; do
   filename="$(basename "$f")"
-  substitute "$f" "$TARGET/agents/$filename"
   substitute "$f" "$TARGET/.opencode/agents/$filename"
-  log "  → agents/$filename"
+  log "  → .opencode/agents/$filename"
 done
 
 # ── Sync opencode config and rules ────────────────────────────────────────────

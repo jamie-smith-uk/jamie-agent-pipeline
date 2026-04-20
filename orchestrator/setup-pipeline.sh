@@ -58,9 +58,8 @@ substitute() {
 
 # ── Copy agent files ──────────────────────────────────────────────────────────
 log "Copying agent files..."
-for f in "$PIPELINE_REPO"/agents/*.md; do
+for f in "$PIPELINE_REPO"/.opencode/agents/*.md; do
   filename="$(basename "$f")"
-  substitute "$f" "$TARGET/agents/$filename"
   substitute "$f" "$TARGET/.opencode/agents/$filename"
 done
 
