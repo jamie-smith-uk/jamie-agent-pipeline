@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-# ── {PROJECT_NAME} Pipeline Runner ──────────────────────────────────────────────────
+# ── {PROJECT_NAME} Pipeline Runner ───────────────────────────────────────────
 # Usage: ./orchestrator/run-phase.sh --phase 1
 # Requires: opencode CLI, ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_ID
 
@@ -20,7 +20,7 @@ if [ -z "$PHASE" ]; then
   exit 1
 fi
 
-# ── Paths ────────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIPELINE_DIR="$REPO_ROOT/pipeline/phase-$PHASE"
 AGENTS_DIR="$REPO_ROOT/agents"
@@ -33,6 +33,11 @@ if [ -f "$REPO_ROOT/.env" ]; then
   set +a
 fi
 
+# ── Validate required env vars ────────────────────────────────────────────────
+: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is not set — check your .env}"
+: "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is not set — check your .env}"
+: "${TELEGRAM_ALLOWED_CHAT_ID:?TELEGRAM_ALLOWED_CHAT_ID is not set — check your .env}"
+
 # Construct DATABASE_URL from individual vars if not already set
 if [ -z "${DATABASE_URL:-}" ]; then
   DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
@@ -41,7 +46,7 @@ fi
 
 mkdir -p "$PIPELINE_DIR"
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
 halt() {
@@ -113,12 +118,15 @@ wait_for_approval() {
   halt "Approval timeout" "human-gate" "No approval signal received within 24 hours"
 }
 
-report_contains() {
-  local file="$1" word="$2"
-  grep -q "$word" "$file" 2>/dev/null
+# Checks that a report file contains a PASS title line as written by the agents.
+# Matches "Title: ... — PASS" or "# ... — PASS" — avoids false positives from
+# body text that happens to contain the word PASS.
+report_passes() {
+  local file="$1"
+  grep -qE "(Title:|##? .+).*— PASS" "$file" 2>/dev/null
 }
 
-# ── Phase gate ───────────────────────────────────────────────────────────────
+# ── Phase gate ────────────────────────────────────────────────────────────────
 if [ "$PHASE" -gt 1 ]; then
   PREV_PHASE=$(( PHASE - 1 ))
   PREV_REPORT="$REPO_ROOT/pipeline/phase-$PREV_PHASE/validation-report.md"
@@ -127,17 +135,17 @@ if [ "$PHASE" -gt 1 ]; then
     halt "Phase $PREV_PHASE not complete" "orchestrator" "validation-report.md not found for phase $PREV_PHASE"
   fi
 
-  if ! report_contains "$PREV_REPORT" "PASS"; then
-    halt "Phase $PREV_PHASE did not pass validation" "orchestrator" "validation-report.md for phase $PREV_PHASE does not contain PASS"
+  if ! report_passes "$PREV_REPORT"; then
+    halt "Phase $PREV_PHASE did not pass validation" "orchestrator" "validation-report.md for phase $PREV_PHASE does not contain a PASS title"
   fi
 fi
 
-# ── Header ───────────────────────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────────────────────
 log "========================================"
 log "{PROJECT_NAME} Pipeline — Phase $PHASE"
 log "========================================"
 
-# ── AG-01 Architect ──────────────────────────────────────────────────────────
+# ── AG-01 Architect ───────────────────────────────────────────────────────────
 log ""
 log "AG-01 Architect — producing task manifest..."
 
@@ -175,7 +183,7 @@ for t in tasks:
         print(f\"  {t['id']}: {t['title']}{flag}\")
 "
 
-# ── AG-02 Reviewer ───────────────────────────────────────────────────────────
+# ── AG-02 Reviewer ────────────────────────────────────────────────────────────
 log ""
 log "AG-02 Reviewer — preparing human review..."
 
@@ -207,7 +215,7 @@ Reply with: approve | changes: [what to change] | stop" \
 
 log "Reviewer summary sent to Telegram"
 
-# ── Human gate ───────────────────────────────────────────────────────────────
+# ── Human gate ────────────────────────────────────────────────────────────────
 log ""
 log "========================================"
 log "HUMAN GATE — waiting for your reply..."
@@ -219,9 +227,18 @@ if [ "$APPROVAL" = "stop" ]; then
   halt "User stopped the pipeline" "human-gate" "User replied 'stop'"
 fi
 
-if [[ "$APPROVAL" == changes:* ]]; then
-  CHANGES="${APPROVAL#changes: }"
-  log "Changes requested: $CHANGES"
+MAX_REVISIONS=3
+REVISION=0
+
+while [[ "$APPROVAL" == changes:* ]]; do
+  REVISION=$(( REVISION + 1 ))
+  if [ "$REVISION" -gt "$MAX_REVISIONS" ]; then
+    halt "Manifest revised $MAX_REVISIONS times without approval" "human-gate" "Too many revision rounds — stopping pipeline"
+  fi
+
+  CHANGES="${APPROVAL#changes:}"
+  CHANGES="${CHANGES# }"
+  log "Changes requested (round $REVISION/$MAX_REVISIONS): $CHANGES"
   log "Re-running Architect with feedback..."
 
   ARCH_PROMPT_REVISED="$ARCH_PROMPT
@@ -230,15 +247,19 @@ The user has reviewed the manifest and requested these changes: $CHANGES
 
 Revise the manifest accordingly and rewrite task-manifest.json and manifest-summary.md."
 
-  run_agent "ag-01-architect" "$ARCH_PROMPT_REVISED" "$PIPELINE_DIR/ag01-output-revised.md"
-  run_agent "ag-02-reviewer" "$REVIEW_PROMPT" "$PIPELINE_DIR/ag02-output-revised.md"
+  run_agent "ag-01-architect" "$ARCH_PROMPT_REVISED" "$PIPELINE_DIR/ag01-output-revised-$REVISION.md"
+  run_agent "ag-02-reviewer" "$REVIEW_PROMPT" "$PIPELINE_DIR/ag02-output-revised-$REVISION.md"
 
   rm -f "$PIPELINE_DIR/approval.json"
   APPROVAL=$(wait_for_approval)
 
-  if [ "$APPROVAL" != "approve" ]; then
-    halt "User did not approve after revision" "human-gate" "Signal received: $APPROVAL"
+  if [ "$APPROVAL" = "stop" ]; then
+    halt "User stopped the pipeline" "human-gate" "User replied 'stop' during revision"
   fi
+done
+
+if [ "$APPROVAL" != "approve" ]; then
+  halt "Unexpected approval signal" "human-gate" "Signal received: $APPROVAL"
 fi
 
 log "Approved. Starting implementation..."
@@ -251,7 +272,7 @@ with open('$PIPELINE_DIR/approval.json', 'w') as f:
     json.dump(data, f, indent=2)
 "
 
-# ── Task loop ────────────────────────────────────────────────────────────────
+# ── Task loop ─────────────────────────────────────────────────────────────────
 TASKS=$(python3 -c "
 import json
 data = json.load(open('$PIPELINE_DIR/task-manifest.json'))
@@ -269,8 +290,8 @@ for TASK_ID in $TASKS; do
   SEC_REPORT="$TASK_DIR/security-report.md"
   TEST_REPORT="$TASK_DIR/test-report.md"
 
-  if [ -f "$SEC_REPORT" ] && report_contains "$SEC_REPORT" "PASS" && \
-     [ -f "$TEST_REPORT" ] && report_contains "$TEST_REPORT" "PASS"; then
+  if [ -f "$SEC_REPORT" ] && report_passes "$SEC_REPORT" && \
+     [ -f "$TEST_REPORT" ] && report_passes "$TEST_REPORT"; then
     log "Task $TASK_ID already complete — skipping"
     continue
   fi
@@ -296,7 +317,7 @@ print(task['title'])
   log "Task: $TASK_ID — $TASK_TITLE"
   log "========================================"
 
-  # ── Developer + Security loop ─────────────────────────────────────────────
+  # ── Developer + Security loop ──────────────────────────────────────────────
   SECURITY_PASSED=false
   SECURITY_ATTEMPTS=0
 
@@ -313,7 +334,7 @@ Write self-assessment.md to pipeline/phase-$PHASE/$TASK_ID/
 Follow your system prompt exactly. Apply all security rules.
 
 ## Environment
-Do not read .env directly. Database connection details will be provided to the tester separately. Use process.env.DATABASE_URL for any database connections in the implementation code."
+Do not read .env directly. Use process.env.DATABASE_URL for any database connections."
 
     run_agent "ag-03-developer" "$DEV_PROMPT" "$TASK_DIR/dev-output.md"
 
@@ -332,18 +353,11 @@ $TASK_JSON
 
 Apply every rule in agents/security-rules.md to every file in files_in_scope.
 Write security-report.md to pipeline/phase-$PHASE/$TASK_ID/
-Return PASS or FAIL with specific findings.
-
-## Environment reference
-DATABASE_URL=$DATABASE_URL
-POSTGRES_HOST=$POSTGRES_HOST
-POSTGRES_PORT=$POSTGRES_PORT
-POSTGRES_USER=$POSTGRES_USER
-POSTGRES_DB=$POSTGRES_DB"
+Return PASS or FAIL with specific findings."
 
     run_agent "ag-04-security" "$SEC_PROMPT" "$TASK_DIR/sec-output.md"
 
-    if [ -f "$TASK_DIR/security-report.md" ] && report_contains "$TASK_DIR/security-report.md" "PASS"; then
+    if [ -f "$TASK_DIR/security-report.md" ] && report_passes "$TASK_DIR/security-report.md"; then
       SECURITY_PASSED=true
       log "Security: PASS"
     else
@@ -354,7 +368,7 @@ POSTGRES_DB=$POSTGRES_DB"
     fi
   done
 
-  # ── Tester loop ───────────────────────────────────────────────────────────
+  # ── Tester loop ────────────────────────────────────────────────────────────
   TEST_PASSED=false
   TEST_ATTEMPTS=0
 
@@ -372,20 +386,12 @@ Every acceptance criterion must have at least one passing test.
 Write test-report.md to pipeline/phase-$PHASE/$TASK_ID/
 Return PASS or FAIL with full test output.
 
-## Environment for testing
-Use these values for database connections in tests — do not read .env:
-DATABASE_URL=$DATABASE_URL
-POSTGRES_HOST=$POSTGRES_HOST
-POSTGRES_PORT=$POSTGRES_PORT
-POSTGRES_USER=$POSTGRES_USER
-POSTGRES_DB=$POSTGRES_DB
-
-For tests requiring a database connection, use DATABASE_URL directly.
-Mock the Telegram API, Anthropic API, Google Calendar MCP, and Gmail MCP — do not make real calls to these services in tests."
+Database connection details are available via process.env.DATABASE_URL — do not read .env directly.
+Mock all external services — do not make real API calls in tests."
 
     run_agent "ag-05-tester" "$TEST_PROMPT" "$TASK_DIR/test-output.md"
 
-    if [ -f "$TASK_DIR/test-report.md" ] && report_contains "$TASK_DIR/test-report.md" "PASS"; then
+    if [ -f "$TASK_DIR/test-report.md" ] && report_passes "$TASK_DIR/test-report.md"; then
       TEST_PASSED=true
       log "Tests: PASS"
     else
@@ -399,7 +405,7 @@ Mock the Telegram API, Anthropic API, Google Calendar MCP, and Gmail MCP — do 
   log "Task $TASK_ID: COMPLETE"
 done
 
-# ── AG-06 Validator ──────────────────────────────────────────────────────────
+# ── AG-06 Validator ───────────────────────────────────────────────────────────
 log ""
 log "========================================"
 log "AG-06 Validator — end-to-end phase check"
@@ -433,7 +439,7 @@ Do not send any Telegram messages. The shell script handles notifications."
 
   run_agent "ag-06-validator" "$VAL_PROMPT" "$PIPELINE_DIR/val-output.md"
 
-  if [ -f "$PIPELINE_DIR/validation-report.md" ] && report_contains "$PIPELINE_DIR/validation-report.md" "PASS"; then
+  if [ -f "$PIPELINE_DIR/validation-report.md" ] && report_passes "$PIPELINE_DIR/validation-report.md"; then
     VALIDATION_PASSED=true
 
     # Send Telegram notification on phase PASS

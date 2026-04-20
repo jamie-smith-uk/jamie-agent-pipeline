@@ -47,11 +47,12 @@ mkdir -p \
   "$TARGET/migrations"
 
 # ── Substitution helper ───────────────────────────────────────────────────────
+# Use | as delimiter so project names containing / don't break sed
 substitute() {
   local src="$1" dst="$2"
   sed \
-    -e "s/{PROJECT_NAME}/$PROJECT_NAME/g" \
-    -e "s/{project-name}/$PROJECT_SLUG/g" \
+    -e "s|{PROJECT_NAME}|$PROJECT_NAME|g" \
+    -e "s|{project-name}|$PROJECT_SLUG|g" \
     "$src" > "$dst"
 }
 
@@ -139,9 +140,10 @@ read -r -p "Do you want to configure Telegram and API keys now? (y/n) " configur
 
 if [[ "$configure_keys" =~ ^[Yy]$ ]]; then
   echo ""
-  read -r -p "  TELEGRAM_BOT_TOKEN:      " TELEGRAM_BOT_TOKEN
-  read -r -p "  TELEGRAM_ALLOWED_CHAT_ID: " TELEGRAM_ALLOWED_CHAT_ID
-  read -r -p "  ANTHROPIC_API_KEY:        " ANTHROPIC_API_KEY
+  # Use silent read (-s) so tokens don't appear in terminal scrollback
+  read -rs -p "  TELEGRAM_BOT_TOKEN:       " TELEGRAM_BOT_TOKEN;       echo
+  read -rs -p "  TELEGRAM_ALLOWED_CHAT_ID: " TELEGRAM_ALLOWED_CHAT_ID; echo
+  read -rs -p "  ANTHROPIC_API_KEY:         " ANTHROPIC_API_KEY;        echo
   echo ""
 
   if [ -f "$TARGET/.env" ]; then

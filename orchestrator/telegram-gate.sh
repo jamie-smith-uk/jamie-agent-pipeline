@@ -6,10 +6,11 @@
 set -euo pipefail
 
 PHASE=""
-for arg in "$@"; do
-  case $arg in
-    --phase=*) PHASE="${arg#*=}" ;;
-    --phase) PHASE="${2}"; shift ;;
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --phase=*) PHASE="${1#*=}"; shift ;;
+    --phase) PHASE="$2"; shift 2 ;;
+    *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
 
@@ -31,7 +32,7 @@ fi
 echo "Waiting for your Telegram reply..."
 echo "Reply 'approve', 'changes: [what]', or 'stop'"
 
-# Get the latest update_id to use as offset
+# Get the latest update_id to use as offset so we ignore pre-existing messages
 LAST_UPDATE_ID=0
 RESPONSE=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=1&offset=-1")
 LAST_UPDATE_ID=$(echo "$RESPONSE" | python3 -c "
@@ -47,6 +48,8 @@ else:
 DEADLINE=$(( $(date +%s) + 86400 ))
 
 while [ $(date +%s) -lt $DEADLINE ]; do
+  # timeout=10 is a server-side long-poll — curl blocks until a message arrives
+  # or 10 seconds elapse, so no sleep is needed between iterations
   RESPONSE=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${LAST_UPDATE_ID}&timeout=10&allowed_updates=message")
 
   RESULT=$(echo "$RESPONSE" | python3 -c "
@@ -82,7 +85,8 @@ with open('$APPROVAL_FILE', 'w') as f:
       exit 0
 
     elif [[ "$TEXT" == changes:* ]]; then
-      CHANGES="${TEXT#changes: }"
+      CHANGES="${TEXT#changes:}"
+      CHANGES="${CHANGES# }"
       echo "Changes requested: $CHANGES"
       python3 -c "
 import json
@@ -107,8 +111,6 @@ with open('$APPROVAL_FILE', 'w') as f:
       exit 0
     fi
   fi
-
-  sleep 2
 done
 
 echo "Timeout — no approval received"

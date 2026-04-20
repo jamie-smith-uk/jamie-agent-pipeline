@@ -31,11 +31,9 @@ log() { echo "[sync] $*"; }
 
 # ── Detect project name from existing agent files ─────────────────────────────
 PROJECT_NAME=""
-PROJECT_SLUG=""
 
 for candidate in "$TARGET/agents/ag-01-architect.md" "$TARGET/.opencode/agents/ag-01-architect.md"; do
   if [ -f "$candidate" ]; then
-    # Extract name from the "You are the Architect for X" line
     PROJECT_NAME=$(grep -m1 "You are the Architect for" "$candidate" 2>/dev/null | sed 's/.*You are the Architect for \(.*\),.*/\1/' || true)
     if [ -n "$PROJECT_NAME" ]; then
       break
@@ -44,20 +42,26 @@ for candidate in "$TARGET/agents/ag-01-architect.md" "$TARGET/.opencode/agents/a
 done
 
 if [ -z "$PROJECT_NAME" ]; then
-  echo "Error: could not detect project name from existing agent files in $TARGET"
-  echo "Expected agents/ag-01-architect.md or .opencode/agents/ag-01-architect.md to contain:"
-  echo "  \"You are the Architect for <Project Name>,...\""
-  exit 1
+  echo ""
+  echo "Warning: could not auto-detect project name from agent files in $TARGET"
+  echo "Expected 'You are the Architect for <Name>,' in agents/ag-01-architect.md"
+  echo ""
+  read -r -p "Enter the project name exactly (e.g. 'My Project'): " PROJECT_NAME
+  if [ -z "$PROJECT_NAME" ]; then
+    echo "Error: project name is required."
+    exit 1
+  fi
 fi
 
 PROJECT_SLUG=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
 
 # ── Substitution helper ───────────────────────────────────────────────────────
+# Use | as delimiter so project names containing / don't break sed
 substitute() {
   local src="$1" dst="$2"
   sed \
-    -e "s/{PROJECT_NAME}/$PROJECT_NAME/g" \
-    -e "s/{project-name}/$PROJECT_SLUG/g" \
+    -e "s|{PROJECT_NAME}|$PROJECT_NAME|g" \
+    -e "s|{project-name}|$PROJECT_SLUG|g" \
     "$src" > "$dst"
 }
 
