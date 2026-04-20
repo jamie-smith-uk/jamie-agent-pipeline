@@ -71,7 +71,7 @@ cp "$PIPELINE_REPO/.opencode/rules/typescript.md" "$TARGET/.opencode/rules/types
 
 # ── Copy orchestrator scripts ─────────────────────────────────────────────────
 log "Copying orchestrator scripts..."
-for script in run-phase.sh telegram-gate.sh run-task.sh check-pipeline.sh; do
+for script in run-phase.sh telegram-gate.sh run-task.sh check-pipeline.sh telegram-inbox.sh; do
   substitute "$PIPELINE_REPO/orchestrator/$script" "$TARGET/orchestrator/$script"
   chmod +x "$TARGET/orchestrator/$script"
 done

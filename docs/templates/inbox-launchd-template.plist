@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+
+<!--
+  launchd plist for running telegram-inbox.sh as a persistent background service on macOS.
+
+  SETUP:
+  1. Copy this file to ~/Library/LaunchAgents/com.pipeline.inbox.plist
+  2. Replace /path/to/your/project with the absolute path to your project root
+  3. Load it: launchctl load ~/Library/LaunchAgents/com.pipeline.inbox.plist
+
+  COMMANDS:
+    Start:   launchctl start com.pipeline.inbox
+    Stop:    launchctl stop com.pipeline.inbox
+    Unload:  launchctl unload ~/Library/LaunchAgents/com.pipeline.inbox.plist
+    Logs:    tail -f /path/to/your/project/pipeline/inbox/inbox.log
+-->
+
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pipeline.inbox</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/path/to/your/project/orchestrator/telegram-inbox.sh</string>
+    </array>
+
+    <!-- Start automatically when loaded and restart if it exits -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Write stdout and stderr to the same log file -->
+    <key>StandardOutPath</key>
+    <string>/path/to/your/project/pipeline/inbox/inbox.log</string>
+    <key>StandardErrorPath</key>
+    <string>/path/to/your/project/pipeline/inbox/inbox.log</string>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/path/to/your/project</string>
+
+    <!-- Environment — add any vars not in your .env here -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>
