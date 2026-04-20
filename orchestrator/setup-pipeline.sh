@@ -133,6 +133,48 @@ Thumbs.db
 EOF
 fi
 
+# ── Telegram and API key setup ────────────────────────────────────────────────
+echo ""
+read -r -p "Do you want to configure Telegram and API keys now? (y/n) " configure_keys
+
+if [[ "$configure_keys" =~ ^[Yy]$ ]]; then
+  echo ""
+  read -r -p "  TELEGRAM_BOT_TOKEN:      " TELEGRAM_BOT_TOKEN
+  read -r -p "  TELEGRAM_ALLOWED_CHAT_ID: " TELEGRAM_ALLOWED_CHAT_ID
+  read -r -p "  ANTHROPIC_API_KEY:        " ANTHROPIC_API_KEY
+  echo ""
+
+  if [ -f "$TARGET/.env" ]; then
+    log ".env already exists — skipping (edit it manually to add these values)"
+  else
+    cat > "$TARGET/.env" <<EOF
+ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
+
+TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+TELEGRAM_ALLOWED_CHAT_ID=$TELEGRAM_ALLOWED_CHAT_ID
+
+TODOIST_API_TOKEN=
+
+POSTGRES_USER=
+POSTGRES_PASSWORD=
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=$PROJECT_SLUG
+EOF
+    log "Created .env"
+  fi
+else
+  echo ""
+  echo "  To create a Telegram bot:"
+  echo "    1. Open Telegram and search for @BotFather"
+  echo "    2. Send: /newbot"
+  echo "    3. Follow the prompts — BotFather will give you a TELEGRAM_BOT_TOKEN"
+  echo "    4. Message your new bot, then visit:"
+  echo "       https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates"
+  echo "       Your chat ID is in result[0].message.chat.id"
+  echo "    5. Add both values to $TARGET/.env"
+fi
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "========================================"
@@ -143,12 +185,20 @@ echo ""
 echo "Next steps:"
 echo ""
 echo "  1. cd $TARGET"
-echo "  2. Copy .env.example to .env and fill in your values:"
-echo "       ANTHROPIC_API_KEY="
-echo "       TELEGRAM_BOT_TOKEN="
-echo "       TELEGRAM_ALLOWED_CHAT_ID="
-echo "       POSTGRES_USER= / POSTGRES_PASSWORD= / POSTGRES_HOST= / POSTGRES_PORT= / POSTGRES_DB="
-echo ""
+if [[ ! "$configure_keys" =~ ^[Yy]$ ]]; then
+  echo "  2. Create .env and fill in your values:"
+  echo "       ANTHROPIC_API_KEY="
+  echo "       TELEGRAM_BOT_TOKEN="
+  echo "       TELEGRAM_ALLOWED_CHAT_ID="
+  echo "       TODOIST_API_TOKEN="
+  echo "       POSTGRES_USER= / POSTGRES_PASSWORD= / POSTGRES_HOST= / POSTGRES_PORT= / POSTGRES_DB="
+  echo ""
+else
+  echo "  2. Fill in the remaining .env values:"
+  echo "       TODOIST_API_TOKEN="
+  echo "       POSTGRES_USER= / POSTGRES_PASSWORD= / POSTGRES_HOST= / POSTGRES_PORT= / POSTGRES_DB="
+  echo ""
+fi
 if [ ! -f "$TARGET/docs/prd.md" ]; then
   echo "  3. Create docs/prd.md with your product requirements"
 else
