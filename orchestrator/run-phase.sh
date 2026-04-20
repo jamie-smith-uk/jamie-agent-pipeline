@@ -15,7 +15,7 @@ for arg in "$@"; do
   esac
 done
 
-if [ -z "$PHASE" ]; then
+if [[ "${PIPELINE_LIB_ONLY:-}" != "1" ]] && [ -z "$PHASE" ]; then
   echo "Usage: ./orchestrator/run-phase.sh --phase 1"
   exit 1
 fi
@@ -181,7 +181,11 @@ import json, os, sys
 f = sys.argv[1]
 task_id, title, phase = sys.argv[2], sys.argv[3], sys.argv[4]
 duration, attempts, result = int(sys.argv[5]), int(sys.argv[6]), sys.argv[7]
-phase_num, started_at = int(sys.argv[8]), sys.argv[9]
+raw_phase, started_at = sys.argv[8], sys.argv[9]
+try:
+    phase_num = int(raw_phase)
+except ValueError:
+    phase_num = raw_phase
 
 data = json.load(open(f)) if os.path.exists(f) else {
     'phase': phase_num, 'started_at': started_at, 'tasks': {}

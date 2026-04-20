@@ -34,8 +34,11 @@ PROJECT_NAME=""
 
 for candidate in "$TARGET/agents/ag-01-architect.md" "$TARGET/.opencode/agents/ag-01-architect.md"; do
   if [ -f "$candidate" ]; then
-    PROJECT_NAME=$(grep -m1 "You are the Architect for" "$candidate" 2>/dev/null | sed 's/.*You are the Architect for \(.*\),.*/\1/' || true)
-    if [ -n "$PROJECT_NAME" ]; then
+    # Extract project name — stop at the first comma that follows the name.
+    # Limit to 60 chars to avoid picking up an already-expanded description.
+    RAW=$(grep -m1 "You are the Architect for" "$candidate" 2>/dev/null | sed 's/.*You are the Architect for \([^,]*\),.*/\1/' || true)
+    if [ -n "$RAW" ] && [ "${#RAW}" -le 60 ]; then
+      PROJECT_NAME="$RAW"
       break
     fi
   fi
