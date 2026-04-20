@@ -521,7 +521,10 @@ ${out}
 "
   fi
 
-  mapfile -t existing_files < <(python3 -c "
+  existing_files=()
+  while IFS= read -r line; do
+    existing_files+=("$line")
+  done < <(python3 -c "
 import json, os, sys
 files = json.loads(sys.argv[1])
 for f in files:
