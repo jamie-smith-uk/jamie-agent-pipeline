@@ -2,10 +2,19 @@
 
 # Pre-flight check for jamie-agent-pipeline
 # Verifies the environment is correctly configured before running a phase.
-# Usage: ./orchestrator/check-pipeline.sh
+#
+# Usage:
+#   ./orchestrator/check-pipeline.sh             — environment checks only
+#   ./orchestrator/check-pipeline.sh --calibrate — also runs a live agent call
+#
 # Run this after setup-pipeline.sh and before ./orchestrator/run-phase.sh --phase 1
 
 set -euo pipefail
+
+CALIBRATE=false
+for arg in "$@"; do
+  [[ "$arg" == "--calibrate" ]] && CALIBRATE=true
+done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -112,6 +121,36 @@ else
   fail "Expected 8+ agent files, found $AGENT_COUNT — run sync-pipeline.sh"
 fi
 
+# ── Agent calibration (--calibrate only) ─────────────────────────────────────
+if [ "$CALIBRATE" = true ]; then
+  echo ""
+  echo "Agent calibration:"
+  if [ "$FAIL" -gt 0 ]; then
+    warn "Skipping calibration — fix failed checks above first"
+  elif ! command -v opencode > /dev/null 2>&1; then
+    warn "Skipping calibration — opencode not installed"
+  else
+    echo "  Running test agent call (AG-02 Reviewer with minimal prompt)..."
+    CAL_OUTPUT=$(mktemp)
+    CAL_EXIT=0
+    timeout 60 opencode run \
+      --agent "ag-02-reviewer" \
+      "Reply with the single word READY and nothing else. Do not write any files." \
+      > "$CAL_OUTPUT" 2>&1 || CAL_EXIT=$?
+
+    if [ $CAL_EXIT -eq 0 ] && grep -qi "READY" "$CAL_OUTPUT" 2>/dev/null; then
+      ok "Agent responded correctly — pipeline is calibrated"
+    elif [ $CAL_EXIT -eq 0 ]; then
+      warn "Agent responded but output did not contain READY — check agent config"
+      warn "Output: $(head -3 "$CAL_OUTPUT")"
+    else
+      fail "Agent call failed (exit $CAL_EXIT) — check opencode config and API key"
+      echo "    Output: $(head -5 "$CAL_OUTPUT")"
+    fi
+    rm -f "$CAL_OUTPUT"
+  fi
+fi
+
 # ── Results ───────────────────────────────────────────────────────────────────
 echo ""
 echo "========================="
@@ -125,7 +164,11 @@ elif [ "$WARN" -gt 0 ]; then
   echo "Pipeline can run but review the warnings above."
   exit 0
 else
-  echo "All checks passed — ready to run:"
+  if [ "$CALIBRATE" = true ]; then
+    echo "All checks passed and agent is calibrated — ready to run:"
+  else
+    echo "All checks passed — ready to run (or use --calibrate for a live agent test):"
+  fi
   echo "  ./orchestrator/run-phase.sh --phase 1"
   exit 0
 fi

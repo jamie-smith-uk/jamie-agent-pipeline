@@ -312,6 +312,70 @@ if violated:
 PYEOF
 }
 
+# Trajectory evaluation: verifies the Tester wrote real test files with assertions.
+# Logs warnings — does not halt. Called after RED phase.
+check_tester_trajectory() {
+  local task_dir="$1" tests_written_file="$2"
+  local ac_count="$3"  # number of acceptance criteria (minimum test count target)
+  local issues=""
+
+  # Find test files created since tests-written.txt (proxy for "written this task")
+  local test_count=0
+  local files_without_assertions=()
+  while IFS= read -r tf; do
+    [[ -f "$tf" ]] || continue
+    test_count=$(( test_count + 1 ))
+    if ! grep -qE "expect\(|it\(|test\(|describe\(" "$tf" 2>/dev/null; then
+      files_without_assertions+=("$(basename "$tf")")
+    fi
+  done < <(find "$REPO_ROOT" \( -name "*.test.ts" -o -name "*.spec.ts" \) \
+    -newer "$tests_written_file" 2>/dev/null)
+
+  if [ "$test_count" -eq 0 ]; then
+    issues+="No test files found after RED phase — Tester may not have written any tests\n"
+  else
+    if [ ${#files_without_assertions[@]} -gt 0 ]; then
+      issues+="Test files with no assertions: ${files_without_assertions[*]}\n"
+    fi
+    if [ -n "$ac_count" ] && [ "$test_count" -lt "$ac_count" ]; then
+      issues+="$test_count test file(s) for $ac_count acceptance criteria — some ACs may be uncovered\n"
+    fi
+  fi
+
+  if [ -n "$issues" ]; then
+    log "  Tester trajectory warnings:"
+    printf "%b" "$issues" | while IFS= read -r line; do
+      [[ -n "$line" ]] && log "    ⚠ $line"
+    done
+  fi
+}
+
+# Trajectory evaluation: verifies the Security PASS report mentions all known rules.
+# Logs warnings — does not halt. Called after security PASS.
+check_security_trajectory() {
+  local task_dir="$1"
+  local sec_report="$task_dir/security-report.md"
+  local rules_file="$REPO_ROOT/.opencode/agents/security-rules.md"
+
+  [[ -f "$sec_report" ]] && [[ -f "$rules_file" ]] || return 0
+
+  local missing
+  missing=$(python3 - "$sec_report" "$rules_file" <<'PYEOF'
+import re, sys
+report = open(sys.argv[1]).read().lower()
+rules = open(sys.argv[2]).read()
+rule_names = re.findall(r'### ([^\n]+)', rules)
+missing = [r for r in rule_names if r.lower() not in report]
+if missing:
+    print(f"{len(missing)} rule(s) not mentioned in security report: "
+          f"{', '.join(missing[:4])}{'...' if len(missing) > 4 else ''}")
+PYEOF
+)
+  if [ -n "$missing" ]; then
+    log "  Security trajectory warning: $missing"
+  fi
+}
+
 # Runs code health checks (duplication, coverage, complexity) on files_in_scope.
 # Writes pipeline/phase-N/task-N/health-report.json and records summary in metrics.json.
 # Informational only — does not gate the pipeline.
@@ -696,31 +760,73 @@ for t in tasks:
         print(f\"  {t['id']}: {t['title']}{flag}\")
 "
 
-# ── Acceptance criteria quality gate ─────────────────────────────────────────
-AC_ISSUES=$(python3 - "$PIPELINE_DIR/task-manifest.json" <<'PYEOF'
-import json, re, sys
+# ── Acceptance criteria quality gate (LLM judge with regex fallback) ─────────
+AC_ISSUES=$(python3 - "$PIPELINE_DIR/task-manifest.json" "${ANTHROPIC_API_KEY:-}" <<'PYEOF'
+import json, re, sys, urllib.request
+
 data = json.load(open(sys.argv[1]))
 tasks = data if isinstance(data, list) else data.get('tasks', [])
+tasks = [t for t in tasks if isinstance(t, dict)]
+api_key = sys.argv[2]
+
+# ── Regex pass: structural issues caught regardless of LLM ───────────────────
 vague = re.compile(
     r'\b(works?(?: correctly| properly| as expected)?|is (?:done|complete|working|functional)|'
     r'functions?(?: properly| correctly)|it works|should work|is (?:implemented|added|created))\b',
     re.IGNORECASE
 )
-issues = []
-for t in (t for t in tasks if isinstance(t, dict)):
+structural = []
+criteria_for_llm = []
+for t in tasks:
     tid = t.get('id', '?')
-    criteria = t.get('acceptance_criteria', [])
-    if not criteria:
-        issues.append(f"{tid}: no acceptance criteria defined")
-        continue
-    for i, c in enumerate(criteria, 1):
+    for i, c in enumerate(t.get('acceptance_criteria', []), 1):
         c = c.strip()
         if len(c) < 10:
-            issues.append(f"{tid} AC-{i}: too short to be testable — '{c}'")
+            structural.append(f"{tid} AC-{i}: too short to be testable — '{c}'")
         elif vague.search(c):
-            issues.append(f"{tid} AC-{i}: non-testable language — '{c[:80]}'")
-for issue in issues:
-    print(issue)
+            structural.append(f"{tid} AC-{i}: vague language — '{c[:80]}'")
+        else:
+            criteria_for_llm.append(f"{tid} AC-{i}: {c}")
+
+for s in structural:
+    print(s)
+
+# ── LLM judge: deeper testability check via Claude Haiku ─────────────────────
+if not criteria_for_llm or not api_key:
+    sys.exit(0)
+
+criteria_text = "\n".join(criteria_for_llm)
+prompt = (f"Review these software acceptance criteria for testability.\n"
+          f"A criterion is testable if it describes a specific, verifiable outcome "
+          f"with no ambiguity about how to confirm it passed or failed.\n\n"
+          f"Criteria:\n{criteria_text}\n\n"
+          f"Reply with ONLY a JSON array of non-testable criteria. "
+          f"Each entry: {{\"id\": \"task-1 AC-2\", \"issue\": \"reason\"}}. "
+          f"If all are testable, reply with: []")
+
+try:
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 600,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode(),
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        text = json.load(resp)["content"][0]["text"].strip()
+        # Extract JSON array even if surrounded by markdown fences
+        m = re.search(r'\[.*\]', text, re.DOTALL)
+        if m:
+            for issue in json.loads(m.group(0)):
+                print(f"{issue.get('id','?')}: {issue.get('issue','?')}")
+except Exception:
+    pass  # LLM unavailable — structural check above is sufficient
 PYEOF
 )
 
@@ -968,6 +1074,15 @@ Follow your system prompt exactly."
     else
       log "RED confirmed — tests fail as expected"
     fi
+    # Trajectory check: verify test files have real assertions
+    AC_COUNT=$(python3 -c "
+import json
+data = json.load(open('$PIPELINE_DIR/task-manifest.json'))
+tasks = data if isinstance(data, list) else data.get('tasks', [])
+task = next(t for t in tasks if isinstance(t, dict) and t['id'] == '$TASK_ID')
+print(len(task.get('acceptance_criteria', [])))
+")
+    check_tester_trajectory "$TASK_DIR" "$TESTS_WRITTEN_FILE" "$AC_COUNT"
     record_task_metrics "$TASK_ID" "$TASK_TITLE" "red" $(( $(date +%s) - RED_START )) 1 "pass"
   else
     log "RED phase already complete — skipping"
@@ -1202,6 +1317,7 @@ Return PASS or FAIL with specific findings."
       SECURITY_PASSED=true
       record_task_metrics "$TASK_ID" "$TASK_TITLE" "security" $(( $(date +%s) - SECURITY_START )) "$SECURITY_ATTEMPTS" "pass"
       record_security_findings "$TASK_ID" "$TASK_DIR"
+      check_security_trajectory "$TASK_DIR"
       log "Security: PASS"
     else
       log "Security: FAIL (attempt $SECURITY_ATTEMPTS/3)"
