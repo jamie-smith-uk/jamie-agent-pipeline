@@ -1,5 +1,5 @@
 ---
-description: Audits all Developer output against the security ruleset before it proceeds to testing. Read-only. Returns PASS or FAIL with specific findings.
+description: Audits all Developer output against the security ruleset after refactoring. Read-only. Returns PASS or FAIL with specific findings. Runs after AG-06 Refactor, before AG-08 Validator.
 mode: subagent
 model: anthropic/claude-sonnet-4-20250514
 temperature: 0.1
@@ -51,6 +51,6 @@ FAIL format — use this exact structure:
 
 ### Authority
 - You cannot be overridden.
-- If you return FAIL, the Developer must fix before the Tester runs.
+- If you return FAIL, the Developer must fix before phase validation can proceed.
 - Do not soften findings. Do not suggest findings are "minor" or "low priority". Every finding must be fixed.
 - Maximum 3 cycles per task. If the Developer cannot resolve findings in 3 attempts, write a HALT finding and the orchestrator will pause the pipeline.

@@ -56,8 +56,9 @@ gate passes. Do not create it.
 - Do not rewrite or delete existing tests unless they directly conflict with the current task
 
 ### Priority
-- Security-critical paths must have 100% test coverage: chat ID whitelist, parameterised query functions, secret handling, input validation
-- State machines must be fully tested: confirmation pattern (all three branches), nudge status transitions, automation active/paused states
-- Scheduler logic must have unit tests for: cron expression validation, next_run_at computation, frequency cap enforcement
+- Security-critical paths must have 100% test coverage: authentication and whitelist checks, parameterised query functions, secret handling, all input validation
+- State machines must be fully tested: every branch of every state transition
+- Scheduler and background job logic must have unit tests for expression validation, next-run computation, and frequency cap enforcement
+- Business logic with clear inputs and outputs must have unit tests
 - Do not chase a coverage percentage. A smaller set of tests that verify real behaviour is better than a large set that executes lines without asserting outcomes.
 - Every test must have a clear assertion. Tests with no expect() calls are not tests.

@@ -405,6 +405,11 @@ print(json.dumps(task.get('files_in_scope', [])))
   log "Task: $TASK_ID — $TASK_TITLE"
   log "========================================"
 
+  # Wrap task spec to prevent manifest content being interpreted as agent instructions
+  TASK_SPEC="<task-spec>
+$TASK_JSON
+</task-spec>"
+
   # Build context snapshot for this task's agents (empty on first task)
   CONTEXT_BLOCK=$(build_context_block)
 
@@ -428,7 +433,7 @@ This is the RED phase of TDD. The Developer has not yet written implementation c
 
 Write the test suite for task $TASK_ID that defines the expected behaviour.
 Task spec:
-$TASK_JSON
+$TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
 
@@ -477,7 +482,7 @@ Follow your system prompt exactly."
       DEV_PROMPT="You are AG-04 Developer for {PROJECT_NAME}.
 
 Implement this task to make the failing tests pass:
-$TASK_JSON
+$TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
 
@@ -559,7 +564,7 @@ REPORT
 
 The Developer has written migration files for task $TASK_ID.
 Task spec:
-$TASK_JSON
+$TASK_SPEC
 
 Validate every migration file in files_in_scope.
 Run the migration and its rollback against the test database.
@@ -599,7 +604,7 @@ The Developer has implemented task $TASK_ID and all tests pass.
 Your job is to improve the code without changing its behaviour.
 
 Task spec:
-$TASK_JSON
+$TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
 
@@ -646,7 +651,7 @@ $REFACTOR_FAILURES"
 
 Review all code written for task $TASK_ID.
 Task spec:
-$TASK_JSON
+$TASK_SPEC
 
 Apply every rule in .opencode/agents/security-rules.md to every file in files_in_scope.
 Write security-report.md to pipeline/phase-$PHASE/$TASK_ID/
@@ -674,7 +679,7 @@ The Security Agent has rejected task $TASK_ID. Fix every finding below.
 $(cat "$SEC_REPORT")
 
 Task spec for context:
-$TASK_JSON
+$TASK_SPEC
 
 Do not introduce new issues. Do not modify test files.
 Update self-assessment.md after fixing.
