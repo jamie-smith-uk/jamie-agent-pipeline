@@ -31,6 +31,10 @@ You are the Developer for {PROJECT_NAME}, a personal AI assistant built on Teleg
    - Any assumptions made
    - TypeScript compiler output (tsc --noEmit)
    - ESLint output
+   - A "## Notes for future agents" section: 3-5 bullet points on key patterns,
+     utilities, or conventions introduced that subsequent tasks should follow
+     (e.g. "All DB queries go through src/db/queries.ts", "Use the logger from
+     src/lib/logger.ts — never console.log")
 
 ## Rules
 

@@ -126,6 +126,14 @@ report_passes() {
   grep -qE "(Title:|##? .+).*— PASS" "$file" 2>/dev/null
 }
 
+# Returns the accumulated build context for this phase if any tasks have completed.
+# Output is empty if no context exists yet (first task in phase).
+build_context_block() {
+  if [ -f "$PIPELINE_DIR/context.md" ] && [ -s "$PIPELINE_DIR/context.md" ]; then
+    printf "## Context from completed tasks in this phase\n\n%s\n" "$(cat "$PIPELINE_DIR/context.md")"
+  fi
+}
+
 # Runs tsc --noEmit, ESLint on files that exist from files_in_scope, and pnpm test.
 # Prints combined failure output to stdout (empty on full pass).
 # Returns 0 if all checks pass, 1 if any fail.
@@ -369,13 +377,11 @@ print(json.dumps(task.get('files_in_scope', [])))
   log "Task: $TASK_ID — $TASK_TITLE"
   log "========================================"
 
+  # Build context snapshot for this task's agents (empty on first task)
+  CONTEXT_BLOCK=$(build_context_block)
+
   # ── RED phase: Tester writes failing tests ────────────────────────────────
   TESTS_WRITTEN_FILE="$TASK_DIR/tests-written.txt"
-
-  if [ ! -f "$TESTS_WRITTEN_FILE" ]; then
-    # Guard against a corrupted prior run: sentinel exists but no test files written
-    : # sentinel check happens after agent run below
-  fi
 
   if [ ! -f "$TESTS_WRITTEN_FILE" ]; then
     log "RED phase — Tester writing failing tests..."
@@ -387,6 +393,8 @@ This is the RED phase of TDD. The Developer has not yet written implementation c
 Write the test suite for task $TASK_ID that defines the expected behaviour.
 Task spec:
 $TASK_JSON
+${CONTEXT_BLOCK:+
+$CONTEXT_BLOCK}
 
 Write test files to the __tests__/ directories as normal.
 Tests will fail right now because there is no implementation — that is correct and expected.
@@ -432,6 +440,8 @@ Follow your system prompt exactly."
 
 Implement this task to make the failing tests pass:
 $TASK_JSON
+${CONTEXT_BLOCK:+
+$CONTEXT_BLOCK}
 
 The Tester has already written failing tests in the __tests__/ directories.
 Your job is to write implementation code that makes every test pass.
@@ -485,7 +495,6 @@ REPORT
   else
     log "GREEN phase already complete — skipping"
 
-    # Ensure test-report.md exists even on resume (may have been lost if script was killed)
     if [ ! -f "$TASK_DIR/test-report.md" ]; then
       cat > "$TASK_DIR/test-report.md" <<REPORT
 Title: Test Report — $TASK_ID — PASS
@@ -499,6 +508,51 @@ REPORT
     fi
   fi
 
+  # ── REFACTOR phase: clean up without changing behaviour ───────────────────
+  REFACTOR_VERIFIED_FILE="$TASK_DIR/refactor-verified.txt"
+
+  if [ ! -f "$REFACTOR_VERIFIED_FILE" ]; then
+    log "REFACTOR phase — AG-05 Refactor..."
+
+    REFACTOR_PROMPT="You are AG-05 Refactor for {PROJECT_NAME}.
+
+The Developer has implemented task $TASK_ID and all tests pass.
+Your job is to improve the code without changing its behaviour.
+
+Task spec:
+$TASK_JSON
+${CONTEXT_BLOCK:+
+$CONTEXT_BLOCK}
+
+Read every file in files_in_scope and the corresponding test files.
+Make conservative, targeted improvements only.
+Do NOT modify test files. Do NOT change public interfaces.
+
+Write refactor-report.md to pipeline/phase-$PHASE/$TASK_ID/
+Follow your system prompt exactly."
+
+    run_agent "ag-05-refactor" "$REFACTOR_PROMPT" "$TASK_DIR/refactor-output.md"
+
+    if [ ! -f "$TASK_DIR/refactor-report.md" ]; then
+      halt "Refactor agent did not write refactor-report.md" "AG-05" \
+        "Task: $TASK_ID — refactor-report.md not found"
+    fi
+
+    # Re-run hard gate to ensure refactor didn't break anything
+    log "Re-running hard gate after refactor..."
+    REFACTOR_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
+    if [ -n "$REFACTOR_FAILURES" ]; then
+      halt "Refactor broke tsc or tests on task $TASK_ID" "AG-05" \
+        "Task: $TASK_ID
+$REFACTOR_FAILURES"
+    fi
+
+    echo "refactor-verified" > "$REFACTOR_VERIFIED_FILE"
+    log "REFACTOR phase: PASS"
+  else
+    log "REFACTOR phase already complete — skipping"
+  fi
+
   # ── Security phase ────────────────────────────────────────────────────────
   SECURITY_PASSED=false
   SECURITY_ATTEMPTS=0
@@ -507,7 +561,7 @@ REPORT
     SECURITY_ATTEMPTS=$(( SECURITY_ATTEMPTS + 1 ))
     log "Security attempt $SECURITY_ATTEMPTS/3..."
 
-    SEC_PROMPT="You are AG-05 Security Agent for {PROJECT_NAME}.
+    SEC_PROMPT="You are AG-06 Security Agent for {PROJECT_NAME}.
 
 Review all code written for task $TASK_ID.
 Task spec:
@@ -517,7 +571,7 @@ Apply every rule in .opencode/agents/security-rules.md to every file in files_in
 Write security-report.md to pipeline/phase-$PHASE/$TASK_ID/
 Return PASS or FAIL with specific findings."
 
-    run_agent "ag-05-security" "$SEC_PROMPT" "$TASK_DIR/sec-output-$SECURITY_ATTEMPTS.md"
+    run_agent "ag-06-security" "$SEC_PROMPT" "$TASK_DIR/sec-output-$SECURITY_ATTEMPTS.md"
 
     if [ -f "$SEC_REPORT" ] && report_passes "$SEC_REPORT"; then
       SECURITY_PASSED=true
@@ -525,11 +579,10 @@ Return PASS or FAIL with specific findings."
     else
       log "Security: FAIL (attempt $SECURITY_ATTEMPTS/3)"
       if [ "$SECURITY_ATTEMPTS" -eq 3 ]; then
-        halt "Security could not be resolved after 3 attempts" "AG-05" \
+        halt "Security could not be resolved after 3 attempts" "AG-06" \
           "Task: $TASK_ID — see $SEC_REPORT"
       fi
 
-      # Developer fixes security findings, then re-run hard gate to ensure fix didn't break tests
       log "Security fix needed — re-running Developer..."
 
       SEC_FIX_PROMPT="You are AG-04 Developer for {PROJECT_NAME}.
@@ -551,8 +604,7 @@ Use process.env.DATABASE_URL for any database connections."
       log "Re-running hard gate after security fix..."
       POST_SEC_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
       if [ -n "$POST_SEC_FAILURES" ]; then
-        # Delete green sentinel so a resume restarts from GREEN, not security
-        rm -f "$GREEN_VERIFIED_FILE"
+        rm -f "$GREEN_VERIFIED_FILE" "$REFACTOR_VERIFIED_FILE"
         halt "Security fix broke tsc or tests on task $TASK_ID" "AG-04" \
           "Task: $TASK_ID
 $POST_SEC_FAILURES"
@@ -561,13 +613,63 @@ $POST_SEC_FAILURES"
     fi
   done
 
+  # ── Context accumulation ──────────────────────────────────────────────────
+  log "Updating build context..."
+  {
+    printf "## %s — %s\n\n" "$TASK_ID" "$TASK_TITLE"
+    printf "**Files:** %s\n\n" "$(python3 -c "
+import json, sys
+print(', '.join(json.loads(sys.argv[1])))
+" "$FILES_IN_SCOPE_JSON")"
+    python3 - "$TASK_DIR/self-assessment.md" <<'PYEOF'
+import re, sys
+try:
+    content = open(sys.argv[1]).read()
+    m = re.search(r'## Notes for future agents\n(.*?)(\n## |\Z)', content, re.DOTALL)
+    if m:
+        print(m.group(1).strip())
+except Exception:
+    pass
+PYEOF
+    printf "\n---\n"
+  } >> "$PIPELINE_DIR/context.md"
+
+  # ── Git commit ────────────────────────────────────────────────────────────
+  log "Committing task $TASK_ID..."
+
+  while IFS= read -r f; do
+    [ -e "$REPO_ROOT/$f" ] && git -C "$REPO_ROOT" add "$f"
+  done < <(python3 -c "
+import json, sys
+for f in json.loads(sys.argv[1]):
+    print(f)
+" "$FILES_IN_SCOPE_JSON")
+
+  while IFS= read -r f; do
+    base=$(basename "${f%.ts}")
+    while IFS= read -r tf; do
+      git -C "$REPO_ROOT" add "$tf"
+    done < <(find "$REPO_ROOT" -path "*/__tests__/${base}*" 2>/dev/null)
+  done < <(python3 -c "
+import json, sys
+for f in json.loads(sys.argv[1]):
+    print(f)
+" "$FILES_IN_SCOPE_JSON")
+
+  if ! git -C "$REPO_ROOT" diff --cached --quiet; then
+    git -C "$REPO_ROOT" commit -m "feat($TASK_ID): $TASK_TITLE"
+    log "Committed: feat($TASK_ID): $TASK_TITLE"
+  else
+    log "Nothing new to commit for $TASK_ID"
+  fi
+
   log "Task $TASK_ID: COMPLETE"
 done
 
-# ── AG-06 Validator ───────────────────────────────────────────────────────────
+# ── AG-07 Validator ───────────────────────────────────────────────────────────
 log ""
 log "========================================"
-log "AG-06 Validator — end-to-end phase check"
+log "AG-07 Validator — end-to-end phase check"
 log "========================================"
 
 VALIDATION_PASSED=false
@@ -577,7 +679,7 @@ while [ "$VALIDATION_PASSED" = false ] && [ "$VALIDATION_ATTEMPTS" -lt 2 ]; do
   VALIDATION_ATTEMPTS=$(( VALIDATION_ATTEMPTS + 1 ))
   log "Validation attempt $VALIDATION_ATTEMPTS/2..."
 
-  VAL_PROMPT="You are AG-06 Validator for {PROJECT_NAME}.
+  VAL_PROMPT="You are AG-07 Validator for {PROJECT_NAME}.
 
 Validate the full Phase $PHASE implementation against the PRD exit criteria in docs/prd.md.
 
@@ -596,7 +698,7 @@ On FAIL:
 
 Do not send any Telegram messages. The shell script handles notifications."
 
-  run_agent "ag-06-validator" "$VAL_PROMPT" "$PIPELINE_DIR/val-output.md"
+  run_agent "ag-07-validator" "$VAL_PROMPT" "$PIPELINE_DIR/val-output.md"
 
   if [ -f "$PIPELINE_DIR/validation-report.md" ] && report_passes "$PIPELINE_DIR/validation-report.md"; then
     VALIDATION_PASSED=true
@@ -618,7 +720,7 @@ ${VAL_TEXT}" \
   else
     log "Validation: FAIL (attempt $VALIDATION_ATTEMPTS/2)"
     if [ "$VALIDATION_ATTEMPTS" -eq 2 ]; then
-      halt "Phase validation failed after 2 attempts" "AG-06" "See pipeline/phase-$PHASE/validation-report.md"
+      halt "Phase validation failed after 2 attempts" "AG-07" "See pipeline/phase-$PHASE/validation-report.md"
     fi
   fi
 done
