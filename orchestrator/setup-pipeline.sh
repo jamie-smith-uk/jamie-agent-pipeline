@@ -38,13 +38,13 @@ echo ""
 # ── Create directories ────────────────────────────────────────────────────────
 log "Creating directory structure..."
 mkdir -p \
-  "$TARGET/agents" \
   "$TARGET/.opencode/agents" \
   "$TARGET/.opencode/rules" \
   "$TARGET/orchestrator" \
   "$TARGET/docs" \
   "$TARGET/pipeline" \
-  "$TARGET/migrations"
+  "$TARGET/migrations" \
+  "$TARGET/smoke-tests"
 
 # ── Substitution helper ───────────────────────────────────────────────────────
 # Use | as delimiter so project names containing / don't break sed
@@ -103,6 +103,14 @@ if [ -f "$TMPL/env-example.txt" ]; then
   fi
 else
   log "  ! docs/templates/env-example.txt not found — skipping .env.example"
+fi
+
+if [ -f "$TMPL/smoke-test-template.sh" ]; then
+  substitute "$TMPL/smoke-test-template.sh" "$TARGET/smoke-tests/phase-1.sh"
+  chmod +x "$TARGET/smoke-tests/phase-1.sh"
+  log "  → smoke-tests/phase-1.sh"
+else
+  log "  ! docs/templates/smoke-test-template.sh not found — skipping smoke-tests/phase-1.sh"
 fi
 
 # ── Create .gitignore ─────────────────────────────────────────────────────────

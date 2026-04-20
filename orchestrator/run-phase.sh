@@ -426,7 +426,34 @@ The user has reviewed the manifest and requested these changes: $CHANGES
 Revise the manifest accordingly and rewrite task-manifest.json and manifest-summary.md."
 
   run_agent "ag-01-architect" "$ARCH_PROMPT_REVISED" "$PIPELINE_DIR/ag01-output-revised-$REVISION.md"
-  run_agent "ag-02-reviewer" "$REVIEW_PROMPT" "$PIPELINE_DIR/ag02-output-revised-$REVISION.md"
+
+  REVIEW_PROMPT_REVISED="You are running as AG-02 Reviewer for {PROJECT_NAME}.
+
+This is revision $REVISION of the manifest. The user requested: $CHANGES
+
+Read pipeline/phase-$PHASE/task-manifest.json and pipeline/phase-$PHASE/manifest-summary.md.
+Also read the previous pipeline/phase-$PHASE/reviewer-summary.md to identify what changed.
+
+Write a revised reviewer-summary.md to pipeline/phase-$PHASE/ using the revision format from
+your system prompt — put the 'What changed' section first, then the standard summary.
+
+Do not send any Telegram messages. Do not make any API calls. Just write the file and stop."
+
+  run_agent "ag-02-reviewer" "$REVIEW_PROMPT_REVISED" "$PIPELINE_DIR/ag02-output-revised-$REVISION.md"
+
+  SUMMARY_FILE="$PIPELINE_DIR/reviewer-summary.md"
+  if [ ! -f "$SUMMARY_FILE" ]; then
+    halt "reviewer-summary.md not produced on revision" "AG-02" "Reviewer did not write the summary file"
+  fi
+  SUMMARY_TEXT=$(head -c 3000 "$SUMMARY_FILE")
+  curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "text=🔄 {PROJECT_NAME} Pipeline — Phase ${PHASE} Review (Revision ${REVISION})
+
+${SUMMARY_TEXT}
+
+Reply with: approve | changes: [what to change] | stop" \
+    -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" > /dev/null
+  log "Revised reviewer summary (revision $REVISION) sent to Telegram"
 
   rm -f "$PIPELINE_DIR/approval.json"
   APPROVAL=$(wait_for_approval)
