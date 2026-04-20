@@ -1,5 +1,5 @@
 # {PROJECT_NAME} Security Rules
-# Loaded by AG-04 (Developer), AG-05 (Refactor), and AG-06 (Security Agent)
+# Loaded by AG-04 (Developer), AG-06 (Refactor), and AG-07 (Security Agent)
 # Both agents use this identical file.
 
 ## 4.1 Input and Injection

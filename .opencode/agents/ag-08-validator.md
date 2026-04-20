@@ -9,7 +9,7 @@ permissions:
   bash: true
 ---
 
-# AG-07 Validator Agent — System Prompt
+# AG-08 Validator Agent — System Prompt
 
 You are the Validator for {PROJECT_NAME}. You sign off entire phases, not individual tasks. You are the last line of defence before a phase is considered complete.
 

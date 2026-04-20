@@ -45,6 +45,7 @@ if [ -z "${DATABASE_URL:-}" ]; then
 fi
 
 mkdir -p "$PIPELINE_DIR"
+PHASE_STARTED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -132,6 +133,33 @@ build_context_block() {
   if [ -f "$PIPELINE_DIR/context.md" ] && [ -s "$PIPELINE_DIR/context.md" ]; then
     printf "## Context from completed tasks in this phase\n\n%s\n" "$(cat "$PIPELINE_DIR/context.md")"
   fi
+}
+
+# Appends one phase entry to pipeline/phase-N/metrics.json (creates file if absent).
+# Args: task_id task_title phase duration_s attempts result
+record_task_metrics() {
+  local task_id="$1" task_title="$2" phase="$3" duration_s="$4" attempts="$5" result="$6"
+  python3 - "$PIPELINE_DIR/metrics.json" \
+    "$task_id" "$task_title" "$phase" "$duration_s" "$attempts" "$result" \
+    "$PHASE" "$PHASE_STARTED_AT" <<'PYEOF'
+import json, os, sys
+f = sys.argv[1]
+task_id, title, phase = sys.argv[2], sys.argv[3], sys.argv[4]
+duration, attempts, result = int(sys.argv[5]), int(sys.argv[6]), sys.argv[7]
+phase_num, started_at = int(sys.argv[8]), sys.argv[9]
+
+data = json.load(open(f)) if os.path.exists(f) else {
+    'phase': phase_num, 'started_at': started_at, 'tasks': {}
+}
+task = data['tasks'].setdefault(task_id, {'title': title})
+task[phase] = {'duration_s': duration, 'attempts': attempts, 'result': result}
+task['total_duration_s'] = sum(
+    v['duration_s'] for v in task.values()
+    if isinstance(v, dict) and 'duration_s' in v
+)
+with open(f, 'w') as fp:
+    json.dump(data, fp, indent=2)
+PYEOF
 }
 
 # Runs tsc --noEmit, ESLint on files that exist from files_in_scope, and pnpm test.
@@ -380,10 +408,18 @@ print(json.dumps(task.get('files_in_scope', [])))
   # Build context snapshot for this task's agents (empty on first task)
   CONTEXT_BLOCK=$(build_context_block)
 
+  # Detect whether this task includes migration files
+  HAS_MIGRATION=$(python3 -c "
+import json, sys
+files = json.loads(sys.argv[1])
+print('true' if any('migration' in f.lower() or f.startswith('migrations/') for f in files) else 'false')
+" "$FILES_IN_SCOPE_JSON")
+
   # ── RED phase: Tester writes failing tests ────────────────────────────────
   TESTS_WRITTEN_FILE="$TASK_DIR/tests-written.txt"
 
   if [ ! -f "$TESTS_WRITTEN_FILE" ]; then
+    RED_START=$(date +%s)
     log "RED phase — Tester writing failing tests..."
 
     RED_PROMPT="You are AG-03 Tester for {PROJECT_NAME}.
@@ -420,6 +456,7 @@ Follow your system prompt exactly."
     else
       log "RED confirmed — tests fail as expected"
     fi
+    record_task_metrics "$TASK_ID" "$TASK_TITLE" "red" $(( $(date +%s) - RED_START )) 1 "pass"
   else
     log "RED phase already complete — skipping"
   fi
@@ -428,6 +465,7 @@ Follow your system prompt exactly."
   GREEN_VERIFIED_FILE="$TASK_DIR/green-verified.txt"
 
   if [ ! -f "$GREEN_VERIFIED_FILE" ]; then
+    GREEN_START=$(date +%s)
     DEV_ATTEMPTS=0
     GREEN_PASSED=false
     GATE_FAILURES=""
@@ -482,6 +520,7 @@ Verified by orchestrator hard gate after Developer attempt $DEV_ATTEMPTS.
 
 $(cat "$TASK_DIR/test-red-output.txt" 2>/dev/null | head -20 || true)
 REPORT
+        record_task_metrics "$TASK_ID" "$TASK_TITLE" "green" $(( $(date +%s) - GREEN_START )) "$DEV_ATTEMPTS" "pass"
         log "GREEN phase: PASS"
       else
         log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/3)"
@@ -508,13 +547,53 @@ REPORT
     fi
   fi
 
+  # ── MIGRATION phase (conditional) ────────────────────────────────────────
+  MIGRATION_VERIFIED_FILE="$TASK_DIR/migration-verified.txt"
+
+  if [ "$HAS_MIGRATION" = "true" ]; then
+    if [ ! -f "$MIGRATION_VERIFIED_FILE" ]; then
+      MIGRATION_START=$(date +%s)
+      log "MIGRATION phase — AG-05 Migration..."
+
+      MIGRATION_PROMPT="You are AG-05 Migration for {PROJECT_NAME}.
+
+The Developer has written migration files for task $TASK_ID.
+Task spec:
+$TASK_JSON
+
+Validate every migration file in files_in_scope.
+Run the migration and its rollback against the test database.
+Write migration-report.md to pipeline/phase-$PHASE/$TASK_ID/
+Follow your system prompt exactly."
+
+      run_agent "ag-05-migration" "$MIGRATION_PROMPT" "$TASK_DIR/migration-output.md"
+
+      if [ ! -f "$TASK_DIR/migration-report.md" ]; then
+        halt "Migration agent did not write migration-report.md" "AG-05" \
+          "Task: $TASK_ID — migration-report.md not found"
+      fi
+
+      if ! report_passes "$TASK_DIR/migration-report.md"; then
+        halt "Migration failed for task $TASK_ID" "AG-05" \
+          "$(cat "$TASK_DIR/migration-report.md")"
+      fi
+
+      echo "migration-verified" > "$MIGRATION_VERIFIED_FILE"
+      record_task_metrics "$TASK_ID" "$TASK_TITLE" "migration" $(( $(date +%s) - MIGRATION_START )) 1 "pass"
+      log "MIGRATION phase: PASS"
+    else
+      log "MIGRATION phase already complete — skipping"
+    fi
+  fi
+
   # ── REFACTOR phase: clean up without changing behaviour ───────────────────
   REFACTOR_VERIFIED_FILE="$TASK_DIR/refactor-verified.txt"
 
   if [ ! -f "$REFACTOR_VERIFIED_FILE" ]; then
-    log "REFACTOR phase — AG-05 Refactor..."
+    REFACTOR_START=$(date +%s)
+    log "REFACTOR phase — AG-06 Refactor..."
 
-    REFACTOR_PROMPT="You are AG-05 Refactor for {PROJECT_NAME}.
+    REFACTOR_PROMPT="You are AG-06 Refactor for {PROJECT_NAME}.
 
 The Developer has implemented task $TASK_ID and all tests pass.
 Your job is to improve the code without changing its behaviour.
@@ -531,10 +610,10 @@ Do NOT modify test files. Do NOT change public interfaces.
 Write refactor-report.md to pipeline/phase-$PHASE/$TASK_ID/
 Follow your system prompt exactly."
 
-    run_agent "ag-05-refactor" "$REFACTOR_PROMPT" "$TASK_DIR/refactor-output.md"
+    run_agent "ag-06-refactor" "$REFACTOR_PROMPT" "$TASK_DIR/refactor-output.md"
 
     if [ ! -f "$TASK_DIR/refactor-report.md" ]; then
-      halt "Refactor agent did not write refactor-report.md" "AG-05" \
+      halt "Refactor agent did not write refactor-report.md" "AG-06" \
         "Task: $TASK_ID — refactor-report.md not found"
     fi
 
@@ -542,12 +621,13 @@ Follow your system prompt exactly."
     log "Re-running hard gate after refactor..."
     REFACTOR_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
     if [ -n "$REFACTOR_FAILURES" ]; then
-      halt "Refactor broke tsc or tests on task $TASK_ID" "AG-05" \
+      halt "Refactor broke tsc or tests on task $TASK_ID" "AG-06" \
         "Task: $TASK_ID
 $REFACTOR_FAILURES"
     fi
 
     echo "refactor-verified" > "$REFACTOR_VERIFIED_FILE"
+    record_task_metrics "$TASK_ID" "$TASK_TITLE" "refactor" $(( $(date +%s) - REFACTOR_START )) 1 "pass"
     log "REFACTOR phase: PASS"
   else
     log "REFACTOR phase already complete — skipping"
@@ -556,12 +636,13 @@ $REFACTOR_FAILURES"
   # ── Security phase ────────────────────────────────────────────────────────
   SECURITY_PASSED=false
   SECURITY_ATTEMPTS=0
+  SECURITY_START=$(date +%s)
 
   while [ "$SECURITY_PASSED" = false ] && [ "$SECURITY_ATTEMPTS" -lt 3 ]; do
     SECURITY_ATTEMPTS=$(( SECURITY_ATTEMPTS + 1 ))
     log "Security attempt $SECURITY_ATTEMPTS/3..."
 
-    SEC_PROMPT="You are AG-06 Security Agent for {PROJECT_NAME}.
+    SEC_PROMPT="You are AG-07 Security Agent for {PROJECT_NAME}.
 
 Review all code written for task $TASK_ID.
 Task spec:
@@ -571,15 +652,16 @@ Apply every rule in .opencode/agents/security-rules.md to every file in files_in
 Write security-report.md to pipeline/phase-$PHASE/$TASK_ID/
 Return PASS or FAIL with specific findings."
 
-    run_agent "ag-06-security" "$SEC_PROMPT" "$TASK_DIR/sec-output-$SECURITY_ATTEMPTS.md"
+    run_agent "ag-07-security" "$SEC_PROMPT" "$TASK_DIR/sec-output-$SECURITY_ATTEMPTS.md"
 
     if [ -f "$SEC_REPORT" ] && report_passes "$SEC_REPORT"; then
       SECURITY_PASSED=true
+      record_task_metrics "$TASK_ID" "$TASK_TITLE" "security" $(( $(date +%s) - SECURITY_START )) "$SECURITY_ATTEMPTS" "pass"
       log "Security: PASS"
     else
       log "Security: FAIL (attempt $SECURITY_ATTEMPTS/3)"
       if [ "$SECURITY_ATTEMPTS" -eq 3 ]; then
-        halt "Security could not be resolved after 3 attempts" "AG-06" \
+        halt "Security could not be resolved after 3 attempts" "AG-07" \
           "Task: $TASK_ID — see $SEC_REPORT"
       fi
 
@@ -605,7 +687,7 @@ Use process.env.DATABASE_URL for any database connections."
       POST_SEC_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
       if [ -n "$POST_SEC_FAILURES" ]; then
         rm -f "$GREEN_VERIFIED_FILE" "$REFACTOR_VERIFIED_FILE"
-        halt "Security fix broke tsc or tests on task $TASK_ID" "AG-04" \
+        halt "Security fix broke tsc or tests on task $TASK_ID" "AG-07" \
           "Task: $TASK_ID
 $POST_SEC_FAILURES"
       fi
@@ -666,10 +748,10 @@ for f in json.loads(sys.argv[1]):
   log "Task $TASK_ID: COMPLETE"
 done
 
-# ── AG-07 Validator ───────────────────────────────────────────────────────────
+# ── AG-08 Validator ───────────────────────────────────────────────────────────
 log ""
 log "========================================"
-log "AG-07 Validator — end-to-end phase check"
+log "AG-08 Validator — end-to-end phase check"
 log "========================================"
 
 VALIDATION_PASSED=false
@@ -679,7 +761,7 @@ while [ "$VALIDATION_PASSED" = false ] && [ "$VALIDATION_ATTEMPTS" -lt 2 ]; do
   VALIDATION_ATTEMPTS=$(( VALIDATION_ATTEMPTS + 1 ))
   log "Validation attempt $VALIDATION_ATTEMPTS/2..."
 
-  VAL_PROMPT="You are AG-07 Validator for {PROJECT_NAME}.
+  VAL_PROMPT="You are AG-08 Validator for {PROJECT_NAME}.
 
 Validate the full Phase $PHASE implementation against the PRD exit criteria in docs/prd.md.
 
@@ -698,7 +780,7 @@ On FAIL:
 
 Do not send any Telegram messages. The shell script handles notifications."
 
-  run_agent "ag-07-validator" "$VAL_PROMPT" "$PIPELINE_DIR/val-output.md"
+  run_agent "ag-08-validator" "$VAL_PROMPT" "$PIPELINE_DIR/val-output.md"
 
   if [ -f "$PIPELINE_DIR/validation-report.md" ] && report_passes "$PIPELINE_DIR/validation-report.md"; then
     VALIDATION_PASSED=true
@@ -720,10 +802,46 @@ ${VAL_TEXT}" \
   else
     log "Validation: FAIL (attempt $VALIDATION_ATTEMPTS/2)"
     if [ "$VALIDATION_ATTEMPTS" -eq 2 ]; then
-      halt "Phase validation failed after 2 attempts" "AG-07" "See pipeline/phase-$PHASE/validation-report.md"
+      halt "Phase validation failed after 2 attempts" "AG-08" "See pipeline/phase-$PHASE/validation-report.md"
     fi
   fi
 done
+
+# ── Phase metrics summary ─────────────────────────────────────────────────────
+python3 - "$PIPELINE_DIR/metrics.json" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" <<'PYEOF'
+import json, os, sys
+f, completed_at = sys.argv[1], sys.argv[2]
+if not os.path.exists(f):
+    sys.exit(0)
+data = json.load(open(f))
+total = sum(t.get('total_duration_s', 0) for t in data['tasks'].values())
+high_retry = [
+    tid for tid, t in data['tasks'].items()
+    if any(v.get('attempts', 1) > 1 for v in t.values() if isinstance(v, dict))
+]
+data['summary'] = {
+    'completed_at': completed_at,
+    'total_duration_s': total,
+    'tasks_completed': len(data['tasks']),
+    'high_retry_tasks': high_retry,
+}
+with open(f, 'w') as fp:
+    json.dump(data, fp, indent=2)
+PYEOF
+
+if [ -s "$PIPELINE_DIR/metrics.json" ]; then
+  log "Metrics summary:"
+  python3 -c "
+import json
+data = json.load(open('$PIPELINE_DIR/metrics.json'))
+s = data.get('summary', {})
+print(f\"  Total time : {s.get('total_duration_s', 0)}s\")
+print(f\"  Tasks done : {s.get('tasks_completed', 0)}\")
+high = s.get('high_retry_tasks', [])
+if high:
+    print(f\"  High-retry : {', '.join(high)}  ← review task specs\")
+"
+fi
 
 # Clean up HALT.md if present from a previous run
 rm -f "$REPO_ROOT/HALT.md"
