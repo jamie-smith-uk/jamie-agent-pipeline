@@ -1,0 +1,587 @@
+#!/bin/bash
+
+# run-task.sh — Run a single task through the agent pipeline.
+# For bug fixes, backlog items, hotfixes, and small features that don't
+# warrant a full PRD phase. Uses the same quality gates as run-phase.sh.
+#
+# Usage:
+#   ./orchestrator/run-task.sh backlog/fix-crash.md   — task file
+#   ./orchestrator/run-task.sh --quick "Fix the crash on long messages"
+#   ./orchestrator/run-task.sh --help
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+TASK_FILE=""
+QUICK_DESC=""
+JSON_INLINE=""
+OPT_REVIEW=false
+OPT_NO_SECURITY=false
+OPT_URGENT=false
+OPT_DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --review)      OPT_REVIEW=true;      shift ;;
+    --no-security) OPT_NO_SECURITY=true; shift ;;
+    --urgent)      OPT_URGENT=true;      shift ;;
+    --dry-run)     OPT_DRY_RUN=true;     shift ;;
+    --quick)       QUICK_DESC="$2";      shift 2 ;;
+    --json)        JSON_INLINE="$2";     shift 2 ;;
+    --help|-h)
+      cat <<'HELP'
+Usage: ./orchestrator/run-task.sh [OPTIONS] [task-file.md]
+
+Inputs (one required):
+  task-file.md              Task file with YAML front matter (see backlog/)
+  --quick "description"     Natural language — Architect generates the spec
+  --json '{...}'            Inline task JSON
+
+Options:
+  --review       Send task spec to Telegram for approval before running
+  --no-security  Skip AG-07 Security (for non-code changes, docs, config)
+  --urgent       Skip Refactor and Mutation testing (hotfix mode)
+  --dry-run      Print the manifest and exit without running agents
+
+Task file format (backlog/my-task.md):
+  ---
+  title: Fix message handler crash on long input
+  security_sensitive: false
+  files:
+    - src/handlers/message.ts
+  criteria:
+    - Messages over 4000 chars are truncated cleanly
+    - A warning is logged when truncation occurs
+  ---
+  ## Context (optional)
+  ...
+HELP
+      exit 0 ;;
+    -*) echo "Unknown option: $1"; exit 1 ;;
+    *)  TASK_FILE="$1"; shift ;;
+  esac
+done
+
+# ── Environment ───────────────────────────────────────────────────────────────
+if [ -f "$REPO_ROOT/.env" ]; then
+  set -a; source "$REPO_ROOT/.env"; set +a
+fi
+
+: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is not set — check your .env}"
+: "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is not set — check your .env}"
+: "${TELEGRAM_ALLOWED_CHAT_ID:?TELEGRAM_ALLOWED_CHAT_ID is not set — check your .env}"
+
+if [ -z "${DATABASE_URL:-}" ] && [ -n "${POSTGRES_USER:-}" ]; then
+  DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
+  export DATABASE_URL
+fi
+
+# Source shared functions from run-phase.sh without running its main code
+PIPELINE_LIB_ONLY=1 source "$SCRIPT_DIR/run-phase.sh"
+
+# Globals the shared functions expect
+PHASE="task"
+PHASE_STARTED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+CONTEXT_MAX_CHARS=4000
+
+# ── Task input helpers ────────────────────────────────────────────────────────
+parse_task_file() {
+  python3 - "$1" <<'PYEOF'
+import json, re, sys
+
+content = open(sys.argv[1]).read()
+m = re.match(r'^---\n(.*?)\n---\n?(.*)', content, re.DOTALL)
+if not m:
+    print(json.dumps({"error": "No YAML front matter found in task file"}), file=sys.stderr)
+    sys.exit(1)
+
+fm_text, body = m.group(1), m.group(2).strip()
+
+result = {}
+current_list = None
+for line in fm_text.split('\n'):
+    if re.match(r'^  - ', line):
+        if current_list is not None:
+            current_list.append(line[4:].strip())
+    elif ':' in line:
+        k, _, v = line.partition(':')
+        k, v = k.strip(), v.strip()
+        if v == '':
+            result[k] = []; current_list = result[k]
+        elif v.lower() == 'true':
+            result[k] = True; current_list = None
+        elif v.lower() == 'false':
+            result[k] = False; current_list = None
+        else:
+            result[k] = v; current_list = None
+
+slug = re.sub(r'[^a-z0-9]+', '-', result.get('title', 'task').lower()).strip('-')[:40]
+task = {
+    'id': slug,
+    'title': result.get('title', 'Unnamed task'),
+    'description': body[:500] if body else result.get('title', ''),
+    'files_in_scope': result.get('files', result.get('files_in_scope', [])),
+    'dependencies': [],
+    'acceptance_criteria': result.get('criteria', result.get('acceptance_criteria', [])),
+    'security_sensitive': result.get('security_sensitive', False),
+    'estimated_complexity': result.get('complexity', 'medium'),
+}
+print(json.dumps(task, indent=2))
+PYEOF
+}
+
+generate_task_from_description() {
+  local description="$1"
+  log "Generating task manifest from description..."
+  python3 - "$description" "${ANTHROPIC_API_KEY}" "$REPO_ROOT" <<'PYEOF'
+import json, re, subprocess, sys, urllib.request
+
+desc, api_key, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    listing = subprocess.run(
+        ['git', 'ls-files', '--cached', '--others', '--exclude-standard'],
+        capture_output=True, text=True, cwd=repo_root, timeout=5
+    ).stdout[:2000]
+except Exception:
+    listing = '(unavailable)'
+
+prompt = (
+    f"You are a software architect. Given this task description and repo file listing, "
+    f"produce a task manifest JSON object.\n\n"
+    f"Task: {desc}\n\nRepo files:\n{listing}\n\n"
+    f"Reply with ONLY valid JSON:\n"
+    f'{{"id":"kebab-slug","title":"Short title","description":"What to build",'
+    f'"files_in_scope":["path/to/file.ts"],"dependencies":[],'
+    f'"acceptance_criteria":["Specific testable criterion"],'
+    f'"security_sensitive":false,"estimated_complexity":"low|medium|high"}}'
+)
+
+try:
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 800,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode(),
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        text = json.load(resp)["content"][0]["text"].strip()
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        if m:
+            print(m.group(0))
+        else:
+            raise ValueError("No JSON in Architect response")
+except Exception as e:
+    print(f"Error generating manifest: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+# ── Resolve task manifest ─────────────────────────────────────────────────────
+if [ -n "$QUICK_DESC" ]; then
+  TASK_JSON=$(generate_task_from_description "$QUICK_DESC")
+elif [ -n "$JSON_INLINE" ]; then
+  TASK_JSON="$JSON_INLINE"
+elif [ -n "$TASK_FILE" ]; then
+  [ -f "$TASK_FILE" ] || { echo "Task file not found: $TASK_FILE"; exit 1; }
+  TASK_JSON=$(parse_task_file "$TASK_FILE")
+else
+  echo "Error: provide a task file, --quick description, or --json payload."
+  echo "Run with --help for usage."
+  exit 1
+fi
+
+python3 -c "import json, sys; json.load(sys.stdin)" <<< "$TASK_JSON" \
+  || { echo "Error: task manifest is not valid JSON"; exit 1; }
+
+TASK_ID=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['id'])" "$TASK_JSON")
+TASK_TITLE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['title'])" "$TASK_JSON")
+FILES_IN_SCOPE_JSON=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1]).get('files_in_scope',[])))" "$TASK_JSON")
+SECURITY_SENSITIVE=$(python3 -c "import json,sys; print('true' if json.loads(sys.argv[1]).get('security_sensitive') else 'false')" "$TASK_JSON")
+HAS_MIGRATION=$(python3 -c "
+import json,sys
+files=json.loads(sys.argv[1])
+print('true' if any('migration' in f.lower() or f.startswith('migrations/') for f in files) else 'false')
+" "$FILES_IN_SCOPE_JSON")
+AC_COUNT=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1]).get('acceptance_criteria',[])))" "$TASK_JSON")
+
+# ── Setup task directory ──────────────────────────────────────────────────────
+SLUG=$(echo "$TASK_ID" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g')
+TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
+TASK_DIR="$REPO_ROOT/pipeline/tasks/$SLUG-$TIMESTAMP"
+PIPELINE_DIR="$TASK_DIR"  # shared functions reference $PIPELINE_DIR
+
+mkdir -p "$TASK_DIR"
+echo "$TASK_JSON" > "$TASK_DIR/task.json"
+
+TASK_SPEC="<task-spec>
+$TASK_JSON
+</task-spec>"
+
+# ── Dry run ───────────────────────────────────────────────────────────────────
+if [ "$OPT_DRY_RUN" = true ]; then
+  echo ""
+  echo "Task manifest:"
+  python3 -m json.tool <<< "$TASK_JSON"
+  echo ""
+  printf "Pipeline: RED → GREEN"
+  [ "$HAS_MIGRATION" = "true" ]                            && printf " → MIGRATION"
+  [ "$OPT_URGENT" != "true" ]                              && printf " → REFACTOR"
+  [ "$SECURITY_SENSITIVE" = "true" ] && [ "$OPT_URGENT" != "true" ] && printf " → MUTATION"
+  [ "$OPT_NO_SECURITY" != "true" ]                         && printf " → SECURITY"
+  printf " → COMMIT\n"
+  exit 0
+fi
+
+log "========================================"
+log "{PROJECT_NAME} — Task: $TASK_TITLE"
+log "========================================"
+log "Mode:$([ "$OPT_URGENT" = "true" ] && echo " URGENT") $([ "$OPT_NO_SECURITY" = "true" ] && echo " NO-SECURITY")"
+log "Dir:  $TASK_DIR"
+
+# ── Optional Telegram review gate ────────────────────────────────────────────
+if [ "$OPT_REVIEW" = true ]; then
+  REVIEW_TEXT="🔍 {PROJECT_NAME} — Task Review
+
+*$TASK_TITLE*
+
+Files: $(python3 -c "import json,sys; print(', '.join(json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")
+Security sensitive: $SECURITY_SENSITIVE
+Criteria:
+$(python3 -c "import json,sys; [print(f'  • {c}') for c in json.loads(sys.argv[1]).get('acceptance_criteria',[])]" "$TASK_JSON")
+
+Reply: approve | stop"
+
+  curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "text=$REVIEW_TEXT" \
+    -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" > /dev/null
+
+  log "Task spec sent to Telegram — waiting for approval (1 hour timeout)..."
+
+  LAST_UPDATE_ID=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=1&offset=-1" \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('result',[]); print(r[-1]['update_id']+1 if r else 0)")
+
+  DEADLINE=$(( $(date +%s) + 3600 ))
+  APPROVED=false
+
+  while [ $(date +%s) -lt $DEADLINE ]; do
+    RESULT=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${LAST_UPDATE_ID}&timeout=10&allowed_updates=message" \
+      | python3 -c "
+import json,sys
+for u in json.load(sys.stdin).get('result',[]):
+    m=u.get('message',{})
+    if str(m.get('chat',{}).get('id',''))=='${TELEGRAM_ALLOWED_CHAT_ID}' and m.get('text','').strip():
+        print(f\"{u['update_id']}|{m['text'].strip().lower()}\")
+        break
+" 2>/dev/null)
+
+    if [ -n "$RESULT" ]; then
+      LAST_UPDATE_ID=$(( $(echo "$RESULT" | cut -d'|' -f1) + 1 ))
+      TEXT=$(echo "$RESULT" | cut -d'|' -f2-)
+      if [ "$TEXT" = "approve" ] || [ "$TEXT" = "yes" ]; then
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          --data-urlencode "text=✅ Approved. Starting implementation..." \
+          -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" > /dev/null
+        APPROVED=true
+        break
+      elif [ "$TEXT" = "stop" ] || [ "$TEXT" = "no" ]; then
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          --data-urlencode "text=🛑 Task stopped." \
+          -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" > /dev/null
+        log "Task stopped by user"
+        exit 0
+      fi
+    fi
+  done
+
+  [ "$APPROVED" = true ] || { log "No approval received within 1 hour — exiting"; exit 1; }
+fi
+
+# ── RED phase ─────────────────────────────────────────────────────────────────
+TESTS_WRITTEN_FILE="$TASK_DIR/tests-written.txt"
+if [ ! -f "$TESTS_WRITTEN_FILE" ]; then
+  RED_START=$(date +%s)
+  log "RED phase — Tester writing failing tests..."
+  CONTEXT_BLOCK=$(build_context_block)
+
+  RED_PROMPT="You are AG-03 Tester for {PROJECT_NAME}.
+RED phase of TDD — no implementation exists yet.
+Write the test suite for this task:
+$TASK_SPEC
+${CONTEXT_BLOCK:+
+$CONTEXT_BLOCK}
+Write test files to __tests__/ directories.
+After writing all tests, write 'tests-written' to: $TASK_DIR/tests-written.txt
+Do NOT write implementation code. Do NOT write test-report.md."
+
+  run_agent "ag-03-tester" "$RED_PROMPT" "$TASK_DIR/tester-red-output.md"
+  [ ! -f "$TESTS_WRITTEN_FILE" ] && halt "Tester did not write tests" "AG-03" "tests-written.txt not found"
+
+  log "Confirming tests fail before implementation..."
+  if (cd "$REPO_ROOT" && pnpm test --run > "$TASK_DIR/test-red-output.txt" 2>&1); then
+    log "WARNING: Tests pass before implementation — verify assertions are meaningful"
+  else
+    log "RED confirmed — tests fail as expected"
+  fi
+  check_tester_trajectory "$TASK_DIR" "$TESTS_WRITTEN_FILE" "$AC_COUNT"
+  record_task_metrics "$TASK_ID" "$TASK_TITLE" "red" $(( $(date +%s) - RED_START )) 1 "pass"
+else
+  log "RED already complete — skipping"
+fi
+
+# ── GREEN phase ───────────────────────────────────────────────────────────────
+GREEN_VERIFIED_FILE="$TASK_DIR/green-verified.txt"
+if [ ! -f "$GREEN_VERIFIED_FILE" ]; then
+  GREEN_START=$(date +%s)
+  DEV_ATTEMPTS=0
+  GREEN_PASSED=false
+  GATE_FAILURES=""
+
+  while [ "$GREEN_PASSED" = false ] && [ "$DEV_ATTEMPTS" -lt 3 ]; do
+    DEV_ATTEMPTS=$(( DEV_ATTEMPTS + 1 ))
+    log "GREEN phase — Developer attempt $DEV_ATTEMPTS/3..."
+
+    CONTEXT_BLOCK=$(build_context_block)
+    DEV_PROMPT="You are AG-04 Developer for {PROJECT_NAME}.
+Implement this task to make the failing tests pass:
+$TASK_SPEC
+${CONTEXT_BLOCK:+
+$CONTEXT_BLOCK}
+Failing tests are in __tests__/. Make them pass. Do not modify tests.
+Write self-assessment.md to $TASK_DIR/
+Apply all security rules. Use process.env.DATABASE_URL for DB connections."
+
+    if [ -n "$GATE_FAILURES" ]; then
+      DEV_PROMPT="$DEV_PROMPT
+
+## Previous attempt failed — fix every item below:
+<gate-failures>
+$GATE_FAILURES
+</gate-failures>"
+    fi
+
+    run_agent "ag-04-developer" "$DEV_PROMPT" "$TASK_DIR/dev-output-$DEV_ATTEMPTS.md"
+    [ -f "$TASK_DIR/BLOCKED.md" ] && halt "Developer blocked" "AG-04" "$(cat "$TASK_DIR/BLOCKED.md")"
+
+    log "Checking files_in_scope compliance..."
+    SCOPE_VIOLATIONS=$(check_scope_compliance "$FILES_IN_SCOPE_JSON") || true
+    SCOPE_GATE=""
+    if [ -n "$SCOPE_VIOLATIONS" ]; then
+      log "Scope violation — reverting..."
+      revert_scope_violations <<< "$SCOPE_VIOLATIONS"
+      SCOPE_GATE="=== files_in_scope violation (reverted) ===
+$SCOPE_VIOLATIONS
+Only write to files listed in files_in_scope."
+    fi
+
+    log "Running hard gate (tsc + eslint + pnpm test)..."
+    IMPL_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
+    GATE_FAILURES="${SCOPE_GATE:+$SCOPE_GATE
+}${IMPL_FAILURES}"
+
+    if [ -z "$GATE_FAILURES" ]; then
+      GREEN_PASSED=true
+      echo "green-verified" > "$GREEN_VERIFIED_FILE"
+      cat > "$TASK_DIR/test-report.md" <<REPORT
+Title: Test Report — $TASK_ID — PASS
+
+Verified by orchestrator hard gate after Developer attempt $DEV_ATTEMPTS.
+
+- tsc --noEmit: PASS
+- eslint (files_in_scope): PASS
+- pnpm test --run: PASS
+REPORT
+      record_task_metrics "$TASK_ID" "$TASK_TITLE" "green" $(( $(date +%s) - GREEN_START )) "$DEV_ATTEMPTS" "pass"
+      log "Code health (pre-refactor baseline):"
+      run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON" "pre-refactor"
+      log "GREEN phase: PASS"
+    else
+      log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/3)"
+      printf "%s" "$GATE_FAILURES" > "$TASK_DIR/gate-failures-$DEV_ATTEMPTS.txt"
+      [ "$DEV_ATTEMPTS" -eq 3 ] && halt "Developer could not pass hard gate" "AG-04" \
+        "See $TASK_DIR/gate-failures-3.txt"
+    fi
+  done
+else
+  log "GREEN already complete — skipping"
+  [ ! -f "$TASK_DIR/test-report.md" ] && printf "Title: Test Report — %s — PASS\n\nRestored on resume.\n" \
+    "$TASK_ID" > "$TASK_DIR/test-report.md"
+fi
+
+# ── MIGRATION (conditional) ───────────────────────────────────────────────────
+MIGRATION_VERIFIED_FILE="$TASK_DIR/migration-verified.txt"
+if [ "$HAS_MIGRATION" = "true" ] && [ ! -f "$MIGRATION_VERIFIED_FILE" ]; then
+  MIGRATION_START=$(date +%s)
+  log "MIGRATION phase..."
+  run_agent "ag-05-migration" "You are AG-05 Migration for {PROJECT_NAME}.
+Validate migration files for: $TASK_SPEC
+Run the migration and rollback. Write migration-report.md to $TASK_DIR/" \
+    "$TASK_DIR/migration-output.md"
+  [ ! -f "$TASK_DIR/migration-report.md" ] && halt "Migration report not written" "AG-05" ""
+  report_passes "$TASK_DIR/migration-report.md" \
+    || halt "Migration failed" "AG-05" "$(cat "$TASK_DIR/migration-report.md")"
+  echo "migration-verified" > "$MIGRATION_VERIFIED_FILE"
+  record_task_metrics "$TASK_ID" "$TASK_TITLE" "migration" $(( $(date +%s) - MIGRATION_START )) 1 "pass"
+  log "MIGRATION: PASS"
+elif [ "$HAS_MIGRATION" = "true" ]; then
+  log "MIGRATION already complete — skipping"
+fi
+
+# ── REFACTOR (skipped with --urgent) ─────────────────────────────────────────
+REFACTOR_VERIFIED_FILE="$TASK_DIR/refactor-verified.txt"
+if [ "$OPT_URGENT" != "true" ] && [ ! -f "$REFACTOR_VERIFIED_FILE" ]; then
+  REFACTOR_START=$(date +%s)
+  log "REFACTOR phase..."
+  CONTEXT_BLOCK=$(build_context_block)
+  run_agent "ag-06-refactor" "You are AG-06 Refactor for {PROJECT_NAME}.
+Improve without changing behaviour: $TASK_SPEC
+${CONTEXT_BLOCK:+
+$CONTEXT_BLOCK}
+Write refactor-report.md to $TASK_DIR/" "$TASK_DIR/refactor-output.md"
+  [ ! -f "$TASK_DIR/refactor-report.md" ] && halt "Refactor report not written" "AG-06" ""
+  REFACTOR_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
+  [ -n "$REFACTOR_FAILURES" ] && halt "Refactor broke tests" "AG-06" "$REFACTOR_FAILURES"
+  echo "refactor-verified" > "$REFACTOR_VERIFIED_FILE"
+  record_task_metrics "$TASK_ID" "$TASK_TITLE" "refactor" $(( $(date +%s) - REFACTOR_START )) 1 "pass"
+  log "Code health (post-refactor):"
+  run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON"
+  if [ -f "$TASK_DIR/health-report-pre.json" ] && [ -f "$TASK_DIR/health-report.json" ]; then
+    python3 - "$TASK_DIR/health-report-pre.json" "$TASK_DIR/health-report.json" <<'PYEOF'
+import json, sys
+pre, post = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+deltas = []
+for k, label, up in [('coverage_pct','coverage',True),('duplication_pct','dup',False)]:
+    if pre.get(k) is not None and post.get(k) is not None:
+        d = round(post[k] - pre[k], 1)
+        if d != 0:
+            good = (d > 0) == up
+            arrow = ('↑' if d > 0 else '↓')
+            deltas.append(f"{label} {arrow}{abs(d)}%")
+if deltas:
+    print(f"  Refactor delta: {' · '.join(deltas)}")
+else:
+    print("  Refactor delta: no measurable change")
+PYEOF
+  fi
+  log "REFACTOR: PASS"
+elif [ "$OPT_URGENT" = "true" ]; then
+  log "REFACTOR skipped (--urgent)"
+else
+  log "REFACTOR already complete — skipping"
+fi
+
+# ── MUTATION TESTING (security-sensitive tasks only) ──────────────────────────
+if [ "$SECURITY_SENSITIVE" = "true" ] && [ "$OPT_URGENT" != "true" ] \
+   && [ ! -f "$TASK_DIR/mutation-report.md" ]; then
+  MUTATION_START=$(date +%s)
+  log "MUTATION TESTING..."
+  run_mutation_tests "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON"
+  record_task_metrics "$TASK_ID" "$TASK_TITLE" "mutation" $(( $(date +%s) - MUTATION_START )) 1 "pass"
+  log "Mutation testing complete"
+fi
+
+# ── SECURITY ──────────────────────────────────────────────────────────────────
+SEC_REPORT="$TASK_DIR/security-report.md"
+if [ "$OPT_NO_SECURITY" != "true" ] && ! ([ -f "$SEC_REPORT" ] && report_passes "$SEC_REPORT"); then
+  SECURITY_PASSED=false
+  SECURITY_ATTEMPTS=0
+  SECURITY_START=$(date +%s)
+
+  while [ "$SECURITY_PASSED" = false ] && [ "$SECURITY_ATTEMPTS" -lt 3 ]; do
+    SECURITY_ATTEMPTS=$(( SECURITY_ATTEMPTS + 1 ))
+    log "Security attempt $SECURITY_ATTEMPTS/3..."
+
+    run_agent "ag-07-security" "You are AG-07 Security Agent for {PROJECT_NAME}.
+Review all code for: $TASK_SPEC
+Apply every rule in .opencode/agents/security-rules.md to every file in files_in_scope.
+Write security-report.md to $TASK_DIR/" "$TASK_DIR/sec-output-$SECURITY_ATTEMPTS.md"
+
+    if [ -f "$SEC_REPORT" ] && report_passes "$SEC_REPORT"; then
+      SECURITY_PASSED=true
+      record_task_metrics "$TASK_ID" "$TASK_TITLE" "security" \
+        $(( $(date +%s) - SECURITY_START )) "$SECURITY_ATTEMPTS" "pass"
+      record_security_findings "$TASK_ID" "$TASK_DIR"
+      check_security_trajectory "$TASK_DIR"
+      log "Security: PASS"
+    else
+      log "Security: FAIL (attempt $SECURITY_ATTEMPTS/3)"
+      [ "$SECURITY_ATTEMPTS" -eq 3 ] && halt "Security failed after 3 attempts" "AG-07" \
+        "$(cat "$SEC_REPORT")"
+
+      run_agent "ag-04-developer" "You are AG-04 Developer for {PROJECT_NAME}.
+Fix every security finding:
+<security-findings>
+$(cat "$SEC_REPORT")
+</security-findings>
+Task context: $TASK_SPEC
+Do not modify test files. Use process.env.DATABASE_URL for DB connections." \
+        "$TASK_DIR/dev-secfix-$SECURITY_ATTEMPTS.md"
+
+      SCOPE_VIOLATIONS=$(check_scope_compliance "$FILES_IN_SCOPE_JSON") || true
+      [ -n "$SCOPE_VIOLATIONS" ] && revert_scope_violations <<< "$SCOPE_VIOLATIONS"
+
+      POST_SEC_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
+      if [ -n "$POST_SEC_FAILURES" ]; then
+        rm -f "$GREEN_VERIFIED_FILE" "$REFACTOR_VERIFIED_FILE"
+        halt "Security fix broke tests" "AG-07" "$POST_SEC_FAILURES"
+      fi
+      log "Post-security hard gate: PASS"
+    fi
+  done
+elif [ "$OPT_NO_SECURITY" = "true" ]; then
+  log "Security skipped (--no-security)"
+else
+  log "Security already passed — skipping"
+fi
+
+# ── Git commit ────────────────────────────────────────────────────────────────
+log "Committing $TASK_ID..."
+
+while IFS= read -r f; do
+  [ -e "$REPO_ROOT/$f" ] && git -C "$REPO_ROOT" add "$f"
+done < <(python3 -c "import json,sys; [print(f) for f in json.loads(sys.argv[1])]" "$FILES_IN_SCOPE_JSON")
+
+while IFS= read -r f; do
+  base=$(basename "${f%.ts}")
+  while IFS= read -r tf; do git -C "$REPO_ROOT" add "$tf"; done \
+    < <(find "$REPO_ROOT" -path "*/__tests__/${base}*" 2>/dev/null)
+done < <(python3 -c "import json,sys; [print(f) for f in json.loads(sys.argv[1])]" "$FILES_IN_SCOPE_JSON")
+
+if ! git -C "$REPO_ROOT" diff --cached --quiet; then
+  git -C "$REPO_ROOT" commit -m "feat($TASK_ID): $TASK_TITLE"
+  log "Committed: feat($TASK_ID): $TASK_TITLE"
+else
+  log "Nothing new to commit"
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+TOTAL_S=$(python3 -c "
+import json, os
+f = '$TASK_DIR/metrics.json'
+if not os.path.exists(f):
+    print('—')
+else:
+    data = json.load(open(f))
+    total = sum(t.get('total_duration_s', 0) for t in data.get('tasks', {}).values())
+    print(f'{total}s')
+")
+
+log ""
+log "========================================"
+log "Task complete: $TASK_TITLE"
+log "Duration     : $TOTAL_S"
+log "Output       : $TASK_DIR"
+log "========================================"
+
+telegram_notify "✅ {PROJECT_NAME} — Task complete
+*$TASK_TITLE* ($TOTAL_S)"

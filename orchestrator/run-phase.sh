@@ -588,6 +588,9 @@ revert_scope_violations() {
   done
 }
 
+# When sourced with PIPELINE_LIB_ONLY=1, stop here — caller gets the functions above.
+[[ "${PIPELINE_LIB_ONLY:-}" == "1" ]] && return 0 2>/dev/null || true
+
 # ── Phase gate ────────────────────────────────────────────────────────────────
 if [ "$PHASE" -gt 1 ]; then
   PREV_PHASE=$(( PHASE - 1 ))

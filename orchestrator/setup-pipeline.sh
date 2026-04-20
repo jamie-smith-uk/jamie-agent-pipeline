@@ -71,10 +71,13 @@ cp "$PIPELINE_REPO/.opencode/rules/typescript.md" "$TARGET/.opencode/rules/types
 
 # ── Copy orchestrator scripts ─────────────────────────────────────────────────
 log "Copying orchestrator scripts..."
-substitute "$PIPELINE_REPO/orchestrator/run-phase.sh" "$TARGET/orchestrator/run-phase.sh"
-substitute "$PIPELINE_REPO/orchestrator/telegram-gate.sh" "$TARGET/orchestrator/telegram-gate.sh"
-chmod +x "$TARGET/orchestrator/run-phase.sh"
-chmod +x "$TARGET/orchestrator/telegram-gate.sh"
+for script in run-phase.sh telegram-gate.sh run-task.sh check-pipeline.sh; do
+  substitute "$PIPELINE_REPO/orchestrator/$script" "$TARGET/orchestrator/$script"
+  chmod +x "$TARGET/orchestrator/$script"
+done
+
+mkdir -p "$TARGET/backlog"
+cp "$PIPELINE_REPO/backlog/README.md" "$TARGET/backlog/README.md" 2>/dev/null || true
 
 # ── Copy doc templates ────────────────────────────────────────────────────────
 log "Copying doc templates..."

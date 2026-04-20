@@ -123,13 +123,11 @@ log "  → .opencode/rules/typescript.md"
 log "Syncing orchestrator scripts..."
 mkdir -p "$TARGET/orchestrator"
 
-substitute "$PIPELINE_REPO/orchestrator/run-phase.sh" "$TARGET/orchestrator/run-phase.sh"
-chmod +x "$TARGET/orchestrator/run-phase.sh"
-log "  → orchestrator/run-phase.sh"
-
-substitute "$PIPELINE_REPO/orchestrator/telegram-gate.sh" "$TARGET/orchestrator/telegram-gate.sh"
-chmod +x "$TARGET/orchestrator/telegram-gate.sh"
-log "  → orchestrator/telegram-gate.sh"
+for script in run-phase.sh telegram-gate.sh run-task.sh check-pipeline.sh; do
+  substitute "$PIPELINE_REPO/orchestrator/$script" "$TARGET/orchestrator/$script"
+  chmod +x "$TARGET/orchestrator/$script"
+  log "  → orchestrator/$script"
+done
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
