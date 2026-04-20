@@ -380,7 +380,7 @@ print(json.dumps(task.get('files_in_scope', [])))
   if [ ! -f "$TESTS_WRITTEN_FILE" ]; then
     log "RED phase — Tester writing failing tests..."
 
-    RED_PROMPT="You are AG-05 Tester for {PROJECT_NAME}.
+    RED_PROMPT="You are AG-03 Tester for {PROJECT_NAME}.
 
 This is the RED phase of TDD. The Developer has not yet written implementation code.
 
@@ -398,10 +398,10 @@ After writing all test files, write the single line 'tests-written' to:
 
 Follow your system prompt exactly."
 
-    run_agent "ag-05-tester" "$RED_PROMPT" "$TASK_DIR/tester-red-output.md"
+    run_agent "ag-03-tester" "$RED_PROMPT" "$TASK_DIR/tester-red-output.md"
 
     if [ ! -f "$TESTS_WRITTEN_FILE" ]; then
-      halt "Tester did not confirm tests written" "AG-05" \
+      halt "Tester did not confirm tests written" "AG-03" \
         "Task: $TASK_ID — tests-written.txt not found after RED phase"
     fi
 
@@ -428,7 +428,7 @@ Follow your system prompt exactly."
       DEV_ATTEMPTS=$(( DEV_ATTEMPTS + 1 ))
       log "GREEN phase — Developer attempt $DEV_ATTEMPTS/3..."
 
-      DEV_PROMPT="You are AG-03 Developer for {PROJECT_NAME}.
+      DEV_PROMPT="You are AG-04 Developer for {PROJECT_NAME}.
 
 Implement this task to make the failing tests pass:
 $TASK_JSON
@@ -449,10 +449,10 @@ Use process.env.DATABASE_URL for any database connections — do not read .env d
 $GATE_FAILURES"
       fi
 
-      run_agent "ag-03-developer" "$DEV_PROMPT" "$TASK_DIR/dev-output-$DEV_ATTEMPTS.md"
+      run_agent "ag-04-developer" "$DEV_PROMPT" "$TASK_DIR/dev-output-$DEV_ATTEMPTS.md"
 
       if [ -f "$TASK_DIR/BLOCKED.md" ]; then
-        halt "Developer blocked on $TASK_ID" "AG-03" "$(cat "$TASK_DIR/BLOCKED.md")"
+        halt "Developer blocked on $TASK_ID" "AG-04" "$(cat "$TASK_DIR/BLOCKED.md")"
       fi
 
       log "Running hard gate (tsc + eslint + pnpm test)..."
@@ -477,7 +477,7 @@ REPORT
         log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/3)"
         printf "%s" "$GATE_FAILURES" > "$TASK_DIR/gate-failures-$DEV_ATTEMPTS.txt"
         if [ "$DEV_ATTEMPTS" -eq 3 ]; then
-          halt "Developer could not pass hard gate after 3 attempts" "AG-03" \
+          halt "Developer could not pass hard gate after 3 attempts" "AG-04" \
             "Task: $TASK_ID — see $TASK_DIR/gate-failures-3.txt"
         fi
       fi
@@ -507,7 +507,7 @@ REPORT
     SECURITY_ATTEMPTS=$(( SECURITY_ATTEMPTS + 1 ))
     log "Security attempt $SECURITY_ATTEMPTS/3..."
 
-    SEC_PROMPT="You are AG-04 Security Agent for {PROJECT_NAME}.
+    SEC_PROMPT="You are AG-05 Security Agent for {PROJECT_NAME}.
 
 Review all code written for task $TASK_ID.
 Task spec:
@@ -517,7 +517,7 @@ Apply every rule in .opencode/agents/security-rules.md to every file in files_in
 Write security-report.md to pipeline/phase-$PHASE/$TASK_ID/
 Return PASS or FAIL with specific findings."
 
-    run_agent "ag-04-security" "$SEC_PROMPT" "$TASK_DIR/sec-output-$SECURITY_ATTEMPTS.md"
+    run_agent "ag-05-security" "$SEC_PROMPT" "$TASK_DIR/sec-output-$SECURITY_ATTEMPTS.md"
 
     if [ -f "$SEC_REPORT" ] && report_passes "$SEC_REPORT"; then
       SECURITY_PASSED=true
@@ -525,14 +525,14 @@ Return PASS or FAIL with specific findings."
     else
       log "Security: FAIL (attempt $SECURITY_ATTEMPTS/3)"
       if [ "$SECURITY_ATTEMPTS" -eq 3 ]; then
-        halt "Security could not be resolved after 3 attempts" "AG-04" \
+        halt "Security could not be resolved after 3 attempts" "AG-05" \
           "Task: $TASK_ID — see $SEC_REPORT"
       fi
 
       # Developer fixes security findings, then re-run hard gate to ensure fix didn't break tests
       log "Security fix needed — re-running Developer..."
 
-      SEC_FIX_PROMPT="You are AG-03 Developer for {PROJECT_NAME}.
+      SEC_FIX_PROMPT="You are AG-04 Developer for {PROJECT_NAME}.
 
 The Security Agent has rejected task $TASK_ID. Fix every finding below.
 
@@ -545,7 +545,7 @@ Do not introduce new issues. Do not modify test files.
 Update self-assessment.md after fixing.
 Use process.env.DATABASE_URL for any database connections."
 
-      run_agent "ag-03-developer" "$SEC_FIX_PROMPT" \
+      run_agent "ag-04-developer" "$SEC_FIX_PROMPT" \
         "$TASK_DIR/dev-secfix-$SECURITY_ATTEMPTS.md"
 
       log "Re-running hard gate after security fix..."
@@ -553,7 +553,7 @@ Use process.env.DATABASE_URL for any database connections."
       if [ -n "$POST_SEC_FAILURES" ]; then
         # Delete green sentinel so a resume restarts from GREEN, not security
         rm -f "$GREEN_VERIFIED_FILE"
-        halt "Security fix broke tsc or tests on task $TASK_ID" "AG-03" \
+        halt "Security fix broke tsc or tests on task $TASK_ID" "AG-04" \
           "Task: $TASK_ID
 $POST_SEC_FAILURES"
       fi
