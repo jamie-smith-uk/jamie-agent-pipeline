@@ -46,7 +46,8 @@ fi
 
 mkdir -p "$PIPELINE_DIR"
 PHASE_STARTED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-CONTEXT_MAX_CHARS=4000  # max context.md chars injected into agent prompts (~1k tokens)
+CONTEXT_MAX_CHARS=4000   # max context.md chars injected into agent prompts (~1k tokens)
+ARCH_DOC_MAX_CHARS=6000  # include full architecture doc below this size; tier above it
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -294,6 +295,108 @@ if violated:
 PYEOF
 }
 
+# Runs code health checks (duplication, coverage, complexity) on files_in_scope.
+# Writes pipeline/phase-N/task-N/health-report.json and records summary in metrics.json.
+# Informational only — does not gate the pipeline.
+run_code_health_checks() {
+  local task_id="$1" task_dir="$2" files_in_scope_json="$3"
+  local report_file="$task_dir/health-report.json"
+
+  python3 - "$REPO_ROOT" "$PIPELINE_DIR/metrics.json" \
+    "$task_id" "$files_in_scope_json" "$report_file" <<'PYEOF'
+import json, os, re, subprocess, sys
+
+repo_root, metrics_file = sys.argv[1], sys.argv[2]
+task_id, files_json, report_file = sys.argv[3], sys.argv[4], sys.argv[5]
+
+files = [f for f in json.loads(files_json)
+         if os.path.isfile(os.path.join(repo_root, f))]
+ts_files = [os.path.join(repo_root, f) for f in files
+            if f.endswith('.ts') or f.endswith('.tsx')]
+
+report = {'task_id': task_id, 'files_checked': files}
+
+# ── Complexity: flag functions > 20 lines ────────────────────────────────────
+complex_fns = []
+for fp in ts_files:
+    try:
+        content = open(fp).read()
+        # Simple heuristic: find function/method bodies by counting lines between braces
+        for m in re.finditer(r'(?:function\s+\w+|(?:async\s+)?\w+\s*\([^)]*\)\s*(?::\s*\S+\s*)?)\s*\{',
+                             content):
+            start_line = content[:m.start()].count('\n') + 1
+            # Count to matching closing brace
+            depth, i = 1, m.end()
+            while i < len(content) and depth > 0:
+                if content[i] == '{':
+                    depth += 1
+                elif content[i] == '}':
+                    depth -= 1
+                i += 1
+            end_line = content[:i].count('\n') + 1
+            length = end_line - start_line
+            if length > 20:
+                rel = os.path.relpath(fp, repo_root)
+                complex_fns.append({'file': rel, 'line': start_line, 'lines': length})
+    except Exception:
+        pass
+report['complex_functions'] = complex_fns[:10]  # cap at 10
+
+# ── Duplication: run jscpd if available ──────────────────────────────────────
+duplication_pct = None
+if ts_files:
+    try:
+        r = subprocess.run(
+            ['npx', '--yes', 'jscpd', '--min-lines', '5', '--reporters', 'json',
+             '--output', '/tmp/jscpd-out', *ts_files],
+            capture_output=True, text=True, cwd=repo_root, timeout=30
+        )
+        jscpd_json = '/tmp/jscpd-out/jscpd-report.json'
+        if os.path.exists(jscpd_json):
+            d = json.load(open(jscpd_json))
+            stats = d.get('statistics', {}).get('total', {})
+            duplication_pct = round(stats.get('percentage', 0), 1)
+    except Exception:
+        pass
+report['duplication_pct'] = duplication_pct
+
+# ── Coverage: run vitest --coverage if available ─────────────────────────────
+coverage_pct = None
+try:
+    r = subprocess.run(
+        ['pnpm', 'test', '--run', '--coverage', '--coverage.reporter=json-summary'],
+        capture_output=True, text=True, cwd=repo_root, timeout=120
+    )
+    summary_file = os.path.join(repo_root, 'coverage', 'coverage-summary.json')
+    if os.path.exists(summary_file):
+        s = json.load(open(summary_file))
+        total = s.get('total', {})
+        lines = total.get('lines', {})
+        if 'pct' in lines:
+            coverage_pct = round(lines['pct'], 1)
+except Exception:
+    pass
+report['coverage_pct'] = coverage_pct
+
+# ── Write report ─────────────────────────────────────────────────────────────
+with open(report_file, 'w') as fp:
+    json.dump(report, fp, indent=2)
+
+# ── Record in metrics ─────────────────────────────────────────────────────────
+if not os.path.exists(metrics_file):
+    sys.exit(0)
+data = json.load(open(metrics_file))
+if task_id in data.get('tasks', {}):
+    data['tasks'][task_id]['health'] = {
+        'complex_fn_count': len(complex_fns),
+        'duplication_pct': duplication_pct,
+        'coverage_pct': coverage_pct,
+    }
+    with open(metrics_file, 'w') as fp:
+        json.dump(data, fp, indent=2)
+PYEOF
+}
+
 # Runs tsc --noEmit, ESLint on files that exist from files_in_scope, and pnpm test.
 # Prints combined failure output to stdout (empty on full pass).
 # Returns 0 if all checks pass, 1 if any fail.
@@ -430,8 +533,52 @@ print(result.strip() if result.strip() else content)
 PYEOF
 )
 
-ARCH_DOC=$(cat "$REPO_ROOT/docs/architecture.md" 2>/dev/null \
-  || echo "(docs/architecture.md not found — create it before running the pipeline)")
+# Tiered architecture doc: inject in full if small; extract relevant sections if large.
+# Keywords are drawn from the phase PRD content so only in-scope sections are included.
+ARCH_DOC=$(python3 - "$REPO_ROOT/docs/architecture.md" \
+  "$ARCH_DOC_MAX_CHARS" "$PHASE_PRD_CONTENT" <<'PYEOF'
+import re, sys
+try:
+    content = open(sys.argv[1]).read()
+except FileNotFoundError:
+    print("(docs/architecture.md not found — create it before running the pipeline)")
+    sys.exit(0)
+
+max_chars, prd_content = int(sys.argv[2]), sys.argv[3]
+
+if len(content) <= max_chars:
+    print(content)
+    sys.exit(0)
+
+# Extract sections: split on ## headings
+parts = re.split(r'\n(## [^\n]+)', content)
+intro = parts[0]  # content before first ## heading
+
+# Always include overview/structure sections regardless of keywords
+always = {'overview', 'system', 'component', 'repository', 'structure', 'stack', 'non-functional'}
+
+# Keywords from phase PRD content (file paths, module names, significant words)
+keywords = set(w for w in re.findall(r'\b[a-z][a-z0-9/_-]{3,}\b', prd_content.lower())
+               if w not in {'this', 'that', 'with', 'from', 'have', 'will', 'each', 'must',
+                            'should', 'phase', 'task', 'file', 'code', 'test', 'spec'})
+
+included = [intro] if intro.strip() else []
+i = 1
+while i < len(parts) - 1:
+    heading, body = parts[i], parts[i + 1]
+    heading_lower = heading.lower()
+    if any(kw in heading_lower for kw in always) or \
+       any(kw in heading_lower or kw in body[:400].lower() for kw in keywords):
+        included.append(heading + body)
+    i += 2
+
+result = '\n'.join(included)
+if len(result) < len(content):
+    result = '*(Architecture doc filtered for relevance — full doc at docs/architecture.md)*\n\n' \
+             + result
+print(result)
+PYEOF
+)
 
 ARCH_PROMPT="You are running as AG-01 Architect for {PROJECT_NAME}.
 
@@ -461,6 +608,62 @@ fi
 
 if [ ! -f "$PIPELINE_DIR/task-manifest.json" ]; then
   halt "task-manifest.json not produced" "AG-01" "Architect did not write task-manifest.json"
+fi
+
+# ── Manifest schema validation ────────────────────────────────────────────────
+SCHEMA_ERRORS=$(python3 - "$PIPELINE_DIR/task-manifest.json" <<'PYEOF'
+import json, sys
+
+try:
+    data = json.load(open(sys.argv[1]))
+except json.JSONDecodeError as e:
+    print(f"Invalid JSON: {e}")
+    sys.exit(0)
+
+tasks = data if isinstance(data, list) else data.get('tasks', [])
+tasks = [t for t in tasks if isinstance(t, dict)]
+
+if not tasks:
+    print("Manifest contains no tasks")
+    sys.exit(0)
+
+required = ['id', 'title', 'description', 'files_in_scope',
+            'acceptance_criteria', 'security_sensitive', 'estimated_complexity']
+valid_complexity = {'low', 'medium', 'high'}
+all_ids = [t.get('id') for t in tasks]
+errors = []
+
+for t in tasks:
+    tid = t.get('id', '(missing id)')
+    for field in required:
+        if field not in t:
+            errors.append(f"{tid}: missing required field '{field}'")
+    if isinstance(t.get('acceptance_criteria'), list) and \
+       len(t.get('acceptance_criteria', [])) == 0:
+        errors.append(f"{tid}: acceptance_criteria is empty")
+    if isinstance(t.get('files_in_scope'), list) and \
+       len(t.get('files_in_scope', [])) == 0:
+        errors.append(f"{tid}: files_in_scope is empty")
+    if t.get('estimated_complexity') not in valid_complexity:
+        errors.append(f"{tid}: estimated_complexity must be low/medium/high, "
+                      f"got '{t.get('estimated_complexity')}'")
+    for dep in t.get('dependencies', []):
+        if dep not in all_ids:
+            errors.append(f"{tid}: dependency '{dep}' is not a valid task id")
+
+if len(all_ids) != len(set(all_ids)):
+    dupes = [i for i in set(all_ids) if all_ids.count(i) > 1]
+    errors.append(f"Duplicate task ids: {', '.join(dupes)}")
+
+for e in errors:
+    print(e)
+PYEOF
+)
+
+if [ -n "$SCHEMA_ERRORS" ]; then
+  halt "task-manifest.json failed schema validation" "AG-01" \
+    "Fix these issues in the manifest before proceeding:
+$SCHEMA_ERRORS"
 fi
 
 log "Manifest produced. Tasks:"
@@ -827,6 +1030,8 @@ Verified by orchestrator hard gate after Developer attempt $DEV_ATTEMPTS.
 $(cat "$TASK_DIR/test-red-output.txt" 2>/dev/null | head -20 || true)
 REPORT
         record_task_metrics "$TASK_ID" "$TASK_TITLE" "green" $(( $(date +%s) - GREEN_START )) "$DEV_ATTEMPTS" "pass"
+        log "Running code health checks..."
+        run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON"
         log "GREEN phase: PASS"
       else
         log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/3)"
@@ -1158,12 +1363,34 @@ for t in data['tasks'].values():
     all_findings.extend(t.get('security_findings', []))
 top_findings = [f"{r} ({c}x)" for r, c in Counter(all_findings).most_common(5)] if all_findings else []
 
+# pass@1 rate: tasks where every phase passed on the first attempt
+tasks_pass_at_1 = sum(
+    1 for t in data['tasks'].values()
+    if all(v.get('attempts', 1) == 1 for v in t.values() if isinstance(v, dict) and 'attempts' in v)
+)
+n = len(data['tasks'])
+pass_at_1_rate = round(100 * tasks_pass_at_1 / n) if n else 0
+
+# Health summary: aggregate across tasks, skip None values
+health_vals = [t.get('health', {}) for t in data['tasks'].values()]
+def avg(vals):
+    v = [x for x in vals if x is not None]
+    return round(sum(v) / len(v), 1) if v else None
+
+health_summary = {
+    'avg_coverage_pct':    avg([h.get('coverage_pct')    for h in health_vals]),
+    'avg_duplication_pct': avg([h.get('duplication_pct') for h in health_vals]),
+    'total_complex_fns':   sum(h.get('complex_fn_count', 0) for h in health_vals),
+}
+
 data['summary'] = {
     'completed_at': completed_at,
     'total_duration_s': total,
-    'tasks_completed': len(data['tasks']),
+    'tasks_completed': n,
+    'pass_at_1_rate': pass_at_1_rate,
     'high_retry_tasks': high_retry,
     'top_security_findings': top_findings,
+    'health': health_summary,
 }
 with open(f, 'w') as fp:
     json.dump(data, fp, indent=2)
@@ -1177,6 +1404,7 @@ data = json.load(open('$PIPELINE_DIR/metrics.json'))
 s = data.get('summary', {})
 print(f\"  Total time : {s.get('total_duration_s', 0)}s\")
 print(f\"  Tasks done : {s.get('tasks_completed', 0)}\")
+print(f\"  Pass@1 rate: {s.get('pass_at_1_rate', 0)}%  ← % of tasks needing no retries\")
 high = s.get('high_retry_tasks', [])
 if high:
     print(f\"  High-retry : {', '.join(high)}  ← review task specs\")
@@ -1185,6 +1413,15 @@ if findings:
     print(f\"  Top security findings:\")
     for finding in findings:
         print(f\"    - {finding}\")
+h = s.get('health', {})
+if any(v is not None for v in h.values()):
+    print(f\"  Code health:\")
+    if h.get('avg_coverage_pct') is not None:
+        print(f\"    Coverage   : {h['avg_coverage_pct']}% avg\")
+    if h.get('avg_duplication_pct') is not None:
+        print(f\"    Duplication: {h['avg_duplication_pct']}% avg\")
+    if h.get('total_complex_fns', 0) > 0:
+        print(f\"    Complex fns: {h['total_complex_fns']} functions > 20 lines\")
 "
 fi
 
