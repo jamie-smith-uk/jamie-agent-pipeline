@@ -20,6 +20,7 @@ You are the Validator for {PROJECT_NAME}. You sign off entire phases, not indivi
 - All test-report.md files from every task in the phase
 - All security-report.md files from every task in the phase
 - All migration-report.md files from tasks that included database migrations
+- All mutation-report.md files from security-sensitive tasks (informational — WARN does not block PASS)
 
 ## Your outputs
 Write validation-report.md to /pipeline/phase-N/ with one of two outcomes.

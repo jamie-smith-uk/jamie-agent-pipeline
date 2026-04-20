@@ -179,6 +179,121 @@ with open(f, 'w') as fp:
 PYEOF
 }
 
+# Mutation testing for security-sensitive tasks. Makes targeted mutations to
+# security-critical lines and checks if tests catch them. Results written to
+# $TASK_DIR/mutation-report.md. Warnings only — not a hard FAIL gate.
+run_mutation_tests() {
+  local task_id="$1" task_dir="$2" files_in_scope_json="$3"
+  local mutations_total=0 mutations_caught=0
+  local survived_list=""
+
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    local full="$REPO_ROOT/$f"
+    [[ -f "$full" ]] || continue
+
+    # Find first line matching a security-critical pattern (priority order)
+    local line_num=""
+    for pat in "TELEGRAM_ALLOWED_CHAT_ID" "chat_id" '\$[0-9]' \
+               "validateInput\|isValid\|sanitize\|whitelist"; do
+      line_num=$(grep -nm1 "$pat" "$full" 2>/dev/null | cut -d: -f1 || true)
+      [[ -n "$line_num" ]] && break
+    done
+    [[ -z "$line_num" ]] && continue
+
+    mutations_total=$(( mutations_total + 1 ))
+
+    # Mutate: comment out the matched line (Python handles cross-platform)
+    python3 -c "
+import sys
+fp, n = sys.argv[1], int(sys.argv[2])
+lines = open(fp).readlines()
+lines[n-1] = '// MUTATED: ' + lines[n-1]
+open(fp, 'w').writelines(lines)
+" "$full" "$line_num"
+
+    if timeout 60 bash -c "cd '$REPO_ROOT' && pnpm test --run" > /dev/null 2>&1; then
+      survived_list+="  - $f line $line_num\n"
+      log "  ⚠ Mutation survived: $f:$line_num"
+    else
+      mutations_caught=$(( mutations_caught + 1 ))
+      log "  ✓ Mutation caught: $f:$line_num"
+    fi
+
+    # Restore original
+    python3 -c "
+import sys
+fp, n = sys.argv[1], int(sys.argv[2])
+lines = open(fp).readlines()
+lines[n-1] = lines[n-1].replace('// MUTATED: ', '', 1)
+open(fp, 'w').writelines(lines)
+" "$full" "$line_num"
+
+  done < <(python3 -c "import json,sys; [print(f) for f in json.loads(sys.argv[1])]" \
+    "$files_in_scope_json")
+
+  {
+    if [ "$mutations_total" -eq 0 ]; then
+      printf "Title: Mutation Report — %s — WARN\n\n" "$task_id"
+      printf "No security-critical patterns found to mutate.\n"
+      printf "Verify that security paths are explicitly tested in __tests__/ files.\n"
+    elif [ "$mutations_caught" -eq "$mutations_total" ]; then
+      printf "Title: Mutation Report — %s — PASS\n\n" "$task_id"
+      printf "All %d mutation(s) caught by tests. Security paths are covered.\n" \
+        "$mutations_total"
+    else
+      local survived=$(( mutations_total - mutations_caught ))
+      printf "Title: Mutation Report — %s — WARN\n\n" "$task_id"
+      printf "%d of %d mutation(s) survived — these security paths may lack test coverage:\n\n" \
+        "$survived" "$mutations_total"
+      printf "%b" "$survived_list"
+      printf "\nAdd tests that verify the security check is enforced when removed.\n"
+    fi
+  } > "$task_dir/mutation-report.md"
+}
+
+# Parses security FAIL outputs for this task and records violated rule categories
+# in metrics.json under tasks.<id>.security_findings.
+record_security_findings() {
+  local task_id="$1" task_dir="$2"
+  python3 - "$PIPELINE_DIR/metrics.json" "$task_id" "$task_dir" <<'PYEOF'
+import json, os, re, sys
+metrics_file, task_id, task_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+if not os.path.exists(metrics_file):
+    sys.exit(0)
+data = json.load(open(metrics_file))
+if task_id not in data.get('tasks', {}):
+    sys.exit(0)
+
+rule_patterns = [
+    "Parameterised queries", "Prompt injection", "Input validation",
+    "Cron injection", "Secrets in .env", "Never log secrets",
+    "Agent exposure", "secrets in git", "Whitelist on every handler",
+    "agent-constructed SQL", "OAuth tokens", "Admin UI",
+    "No PII in logs", "Label all external content", "No stack traces",
+    "Statement timeout", "Zero high or critical", "exact versions",
+    "No unjustified",
+]
+violated = set()
+for fname in sorted(os.listdir(task_dir)):
+    if not fname.startswith('sec-output-'):
+        continue
+    try:
+        content = open(os.path.join(task_dir, fname)).read()
+        if 'FAIL' not in content:
+            continue
+        for pattern in rule_patterns:
+            if re.search(pattern, content, re.IGNORECASE):
+                violated.add(pattern)
+    except Exception:
+        pass
+if violated:
+    data['tasks'][task_id]['security_findings'] = sorted(violated)
+    with open(metrics_file, 'w') as fp:
+        json.dump(data, fp, indent=2)
+PYEOF
+}
+
 # Runs tsc --noEmit, ESLint on files that exist from files_in_scope, and pnpm test.
 # Prints combined failure output to stdout (empty on full pass).
 # Returns 0 if all checks pass, 1 if any fail.
@@ -361,6 +476,39 @@ for t in tasks:
         print(f\"  {t['id']}: {t['title']}{flag}\")
 "
 
+# ── Acceptance criteria quality gate ─────────────────────────────────────────
+AC_ISSUES=$(python3 - "$PIPELINE_DIR/task-manifest.json" <<'PYEOF'
+import json, re, sys
+data = json.load(open(sys.argv[1]))
+tasks = data if isinstance(data, list) else data.get('tasks', [])
+vague = re.compile(
+    r'\b(works?(?: correctly| properly| as expected)?|is (?:done|complete|working|functional)|'
+    r'functions?(?: properly| correctly)|it works|should work|is (?:implemented|added|created))\b',
+    re.IGNORECASE
+)
+issues = []
+for t in (t for t in tasks if isinstance(t, dict)):
+    tid = t.get('id', '?')
+    criteria = t.get('acceptance_criteria', [])
+    if not criteria:
+        issues.append(f"{tid}: no acceptance criteria defined")
+        continue
+    for i, c in enumerate(criteria, 1):
+        c = c.strip()
+        if len(c) < 10:
+            issues.append(f"{tid} AC-{i}: too short to be testable — '{c}'")
+        elif vague.search(c):
+            issues.append(f"{tid} AC-{i}: non-testable language — '{c[:80]}'")
+for issue in issues:
+    print(issue)
+PYEOF
+)
+
+if [ -n "$AC_ISSUES" ]; then
+  log "Acceptance criteria quality warnings:"
+  while IFS= read -r issue; do log "  ! $issue"; done <<< "$AC_ISSUES"
+fi
+
 # ── AG-02 Reviewer ────────────────────────────────────────────────────────────
 log ""
 log "AG-02 Reviewer — preparing human review..."
@@ -372,6 +520,13 @@ Read pipeline/phase-$PHASE/task-manifest.json and pipeline/phase-$PHASE/manifest
 Write reviewer-summary.md to pipeline/phase-$PHASE/ using the format defined in your system prompt.
 
 Do not send any Telegram messages. Do not make any API calls. Just write the file and stop."
+
+if [ -n "$AC_ISSUES" ]; then
+  REVIEW_PROMPT="$REVIEW_PROMPT
+
+The orchestrator detected acceptance criteria quality issues — surface these in 'Concerns or risks':
+$AC_ISSUES"
+fi
 
 run_agent "ag-02-reviewer" "$REVIEW_PROMPT" "$PIPELINE_DIR/ag02-output.md"
 
@@ -542,6 +697,15 @@ import json, sys
 files = json.loads(sys.argv[1])
 print('true' if any('migration' in f.lower() or f.startswith('migrations/') for f in files) else 'false')
 " "$FILES_IN_SCOPE_JSON")
+
+  # Detect whether this task is security-sensitive (triggers mutation testing)
+  SECURITY_SENSITIVE=$(python3 -c "
+import json
+data = json.load(open('$PIPELINE_DIR/task-manifest.json'))
+tasks = data if isinstance(data, list) else data.get('tasks', [])
+task = next(t for t in tasks if isinstance(t, dict) and t['id'] == '$TASK_ID')
+print('true' if task.get('security_sensitive') else 'false')
+")
 
   # ── RED phase: Tester writes failing tests ────────────────────────────────
   TESTS_WRITTEN_FILE="$TASK_DIR/tests-written.txt"
@@ -775,6 +939,20 @@ $REFACTOR_FAILURES"
     log "REFACTOR phase already complete — skipping"
   fi
 
+  # ── MUTATION TESTING (security-sensitive tasks only) ─────────────────────
+  if [ "$SECURITY_SENSITIVE" = "true" ]; then
+    if [ ! -f "$TASK_DIR/mutation-report.md" ]; then
+      MUTATION_START=$(date +%s)
+      log "MUTATION TESTING — task is security_sensitive..."
+      run_mutation_tests "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON"
+      record_task_metrics "$TASK_ID" "$TASK_TITLE" "mutation" \
+        $(( $(date +%s) - MUTATION_START )) 1 "pass"
+      log "Mutation testing complete — see mutation-report.md"
+    else
+      log "MUTATION TESTING already complete — skipping"
+    fi
+  fi
+
   # ── Security phase ────────────────────────────────────────────────────────
   SECURITY_PASSED=false
   SECURITY_ATTEMPTS=0
@@ -799,6 +977,7 @@ Return PASS or FAIL with specific findings."
     if [ -f "$SEC_REPORT" ] && report_passes "$SEC_REPORT"; then
       SECURITY_PASSED=true
       record_task_metrics "$TASK_ID" "$TASK_TITLE" "security" $(( $(date +%s) - SECURITY_START )) "$SECURITY_ATTEMPTS" "pass"
+      record_security_findings "$TASK_ID" "$TASK_DIR"
       log "Security: PASS"
     else
       log "Security: FAIL (attempt $SECURITY_ATTEMPTS/3)"
@@ -967,17 +1146,24 @@ import json, os, sys
 f, completed_at = sys.argv[1], sys.argv[2]
 if not os.path.exists(f):
     sys.exit(0)
+from collections import Counter
 data = json.load(open(f))
 total = sum(t.get('total_duration_s', 0) for t in data['tasks'].values())
 high_retry = [
     tid for tid, t in data['tasks'].items()
     if any(v.get('attempts', 1) > 1 for v in t.values() if isinstance(v, dict))
 ]
+all_findings = []
+for t in data['tasks'].values():
+    all_findings.extend(t.get('security_findings', []))
+top_findings = [f"{r} ({c}x)" for r, c in Counter(all_findings).most_common(5)] if all_findings else []
+
 data['summary'] = {
     'completed_at': completed_at,
     'total_duration_s': total,
     'tasks_completed': len(data['tasks']),
     'high_retry_tasks': high_retry,
+    'top_security_findings': top_findings,
 }
 with open(f, 'w') as fp:
     json.dump(data, fp, indent=2)
@@ -994,6 +1180,11 @@ print(f\"  Tasks done : {s.get('tasks_completed', 0)}\")
 high = s.get('high_retry_tasks', [])
 if high:
     print(f\"  High-retry : {', '.join(high)}  ← review task specs\")
+findings = s.get('top_security_findings', [])
+if findings:
+    print(f\"  Top security findings:\")
+    for finding in findings:
+        print(f\"    - {finding}\")
 "
 fi
 
