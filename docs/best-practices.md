@@ -309,30 +309,48 @@ Treat agent system prompts like code: version them, review changes, test the eff
 
 ### What the pipeline does well
 
-- Generator/evaluator separation — Developer, Security, and Tester are distinct agents with distinct sessions
-- File-based state — all reports persist between runs
-- Atomic tasks — Architect produces a manifest with explicit `files_in_scope` and acceptance criteria
-- Human gate at the right point — approval required before implementation
-- Resumability — completed tasks are skipped on re-run based on PASS report existence
-- Security as a hard gate — Security Agent blocks the pipeline on FAIL with no bypass
+- **Generator/evaluator separation** — Developer, Security, and Tester are distinct agents with distinct sessions and scoped permissions
+- **TDD first** — AG-03 Tester writes failing tests (RED) before AG-04 Developer implements (GREEN); orchestrator hard gate runs `tsc + eslint + pnpm test` directly, not via agent self-report
+- **File-based state** — all pipeline artifacts persist between runs; the pipeline resumes from last checkpoint using sentinel files
+- **Atomic tasks** — Architect produces a manifest with explicit `files_in_scope`, `dependencies`, and testable `acceptance_criteria`
+- **Human gate at the right point** — approval required before implementation, with revision rounds and "What changed" summaries to combat approval fatigue
+- **Security as a hard gate** — AG-07 Security blocks the pipeline on FAIL with no bypass; security findings categorised and tracked in metrics
+- **Prompt injection defence** — all manifest content wrapped in `<task-spec>` tags; external content rules in security-rules.md use explicit `<untrusted>` labelling
+- **Scope enforcement** — `files_in_scope` violations automatically reverted after every Developer run
+- **Mutation testing** — security-sensitive tasks get mutation testing after GREEN to verify tests actually catch removed security checks
+- **Tiered context loading** — Architect receives only the relevant PRD phase section and its epics, not the full document
+- **Metrics** — per-task timing, retry counts, security finding categories, and high-retry signals written to `metrics.json`
+- **Resumability** — sentinel files per phase (tests-written, green-verified, refactor-verified, migration-verified) enable clean mid-task resume
 
-### Current gaps (v1.1 targets)
+### Remaining gaps
 
 | Gap | Description |
 |---|---|
-| Context loading | Agent prompts load the full PRD on every invocation. Move to tiered loading — pass only the relevant phase section. |
-| Test-first ordering | Tester writes tests after implementation. Consider spec-first variant. |
-| Mutation testing | No defence against self-validating tests for security-critical tasks. |
-| Observability | No token spend tracking per agent or phase. |
-| Prompt injection defence | External content passed to agents is not explicitly labelled as untrusted. |
-| Scope enforcement | `files_in_scope` is specified but not enforced at framework level after the run. |
+| Code health monitoring | No cyclomatic complexity, duplication detection, or test coverage tracked over time. The Refactor agent uses judgment, not measurement. |
+| Trajectory evaluation | Pipeline checks end-state (did it write PASS?) but not trajectory (did it take the right actions in the right order?). |
+| Architecture doc tiering | The full architecture doc is still injected into Architect prompts — same tiering applied to the PRD in v1.2 should extend here. |
+| pass@1 rate | `attempts` is tracked per phase but first-attempt pass rate is not computed as a percentage across all tasks. |
+| Task-manifest schema validation | AG-01 output is loosely parsed — not validated against a JSON schema before the Reviewer runs. |
+| LLM judge for acceptance criteria | Regex-based quality gate (v1.3) misses nuanced non-testability. A model-based grader would be more accurate. |
+| Token cost tracking | No token spend recorded per agent or phase — spikes in context loading are invisible. |
+| Agent calibration run | No way to verify the full pipeline is correctly configured on a new project without running a real phase. |
+| Codebase health pre-flight | No pre-phase assessment of codebase patterns that cause agent failures (inconsistent naming, missing types, unresolved TODOs). |
+| Context compaction | `context.md` overflow is handled by truncation — LLM-based summarisation would preserve more signal. |
 
 ### Improvement roadmap
 
-- **v1.1** — Token spend logging, `files_in_scope` post-run enforcement
-- **v1.2** — Tiered context loading, untrusted content labelling
-- **v1.3** — Spec-first testing variant, mutation testing for security-critical tasks
-- **v2.0** — Parallel task execution for independent tasks in the same phase
+**Shipped:**
+- v1.1 — Prompt injection defence, validator completeness, stale agent descriptions, Life OS content removed from templates
+- v1.2 — `files_in_scope` enforcement, tiered Architect context (PRD), `context.md` growth cap
+- v1.3 — Mutation testing, acceptance criteria quality gate, security finding category tracking
+- v1.4 — CLAUDE.md, smoke test template, approval fatigue mitigation (revision format, security tasks first)
+
+**Planned:**
+- **v2.1** — Architecture doc tiered loading · JSON schema validation for task-manifest.json · pass@1 rate metric
+- **v2.2** — Trajectory evaluation · LLM judge for acceptance criteria · Agent calibration script (`check-pipeline.sh`)
+- **v2.3** — Code health monitoring: `jscpd` duplication gate, Vitest coverage tracking, complexity measurement per task; cross-phase health trends in metrics
+- **v2.4** — Codebase health pre-flight agent (AG-00) · Trust boundary hardening · Token cost tracking
+- **v3.0** — Parallel task execution for independent tasks in the same phase (dependency-aware wave execution)
 
 ---
 
@@ -358,10 +376,14 @@ Treat agent system prompts like code: version them, review changes, test the eff
 
 ### Red flags in pipeline output
 - Tests passing 100% on first attempt every time — check for self-validation
+- Mutation testing showing many survived mutations — Tester is writing shallow tests
 - Security reports only catching dependency pinning — Security Agent may not be reading the full ruleset
 - Developer always needs 3 attempts — spec is probably ambiguous, not Developer failure
+- Acceptance criteria quality warnings on every task — PRD needs more specific stories
 - Phase completes but behaviour is wrong — exit criteria were too vague
 - Pipeline is slow and expensive — context loading is probably too broad
+- high_retry_tasks growing across phases — same tasks keep struggling; review those task specs
+- top_security_findings showing the same rule repeatedly — fix the Developer agent prompt, not just the code
 
 ---
 
