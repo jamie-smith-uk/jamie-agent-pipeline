@@ -377,18 +377,25 @@ PYEOF
 }
 
 # Runs code health checks (duplication, coverage, complexity) on files_in_scope.
-# Writes pipeline/phase-N/task-N/health-report.json and records summary in metrics.json.
-# Informational only — does not gate the pipeline.
+# Optional 4th arg "pre-refactor" writes health-report-pre.json for before/after comparison.
+# Logs results immediately. Informational only — does not gate the pipeline.
 run_code_health_checks() {
   local task_id="$1" task_dir="$2" files_in_scope_json="$3"
-  local report_file="$task_dir/health-report.json"
+  local label="${4:-}"
+  local report_file
+  if [ "$label" = "pre-refactor" ]; then
+    report_file="$task_dir/health-report-pre.json"
+  else
+    report_file="$task_dir/health-report.json"
+  fi
 
   python3 - "$REPO_ROOT" "$PIPELINE_DIR/metrics.json" \
-    "$task_id" "$files_in_scope_json" "$report_file" <<'PYEOF'
+    "$task_id" "$files_in_scope_json" "$report_file" "$label" <<'PYEOF'
 import json, os, re, subprocess, sys
 
 repo_root, metrics_file = sys.argv[1], sys.argv[2]
 task_id, files_json, report_file = sys.argv[3], sys.argv[4], sys.argv[5]
+label = sys.argv[6] if len(sys.argv) > 6 else ''
 
 files = [f for f in json.loads(files_json)
          if os.path.isfile(os.path.join(repo_root, f))]
@@ -463,8 +470,25 @@ report['coverage_pct'] = coverage_pct
 with open(report_file, 'w') as fp:
     json.dump(report, fp, indent=2)
 
-# ── Record in metrics ─────────────────────────────────────────────────────────
-if not os.path.exists(metrics_file):
+# ── Log immediately to terminal ───────────────────────────────────────────────
+prefix = 'pre-refactor: ' if label == 'pre-refactor' else ''
+parts = []
+if coverage_pct is not None:
+    parts.append(f'coverage {coverage_pct}%')
+if duplication_pct is not None:
+    parts.append(f'dup {duplication_pct}%')
+if complex_fns:
+    parts.append(f'{len(complex_fns)} complex fn(s)')
+    for fn in complex_fns[:3]:
+        parts_detail = f"    {fn['file']}:{fn['line']} ({fn['lines']} lines)"
+        print(parts_detail)
+if parts:
+    print(f'  {prefix}' + ' · '.join(parts))
+elif files:
+    print(f'  {prefix}(coverage/duplication tools not available)')
+
+# ── Record in metrics (final report only, not pre-refactor baseline) ──────────
+if label == 'pre-refactor' or not os.path.exists(metrics_file):
     sys.exit(0)
 data = json.load(open(metrics_file))
 if task_id in data.get('tasks', {}):
@@ -1164,8 +1188,8 @@ Verified by orchestrator hard gate after Developer attempt $DEV_ATTEMPTS.
 $(cat "$TASK_DIR/test-red-output.txt" 2>/dev/null | head -20 || true)
 REPORT
         record_task_metrics "$TASK_ID" "$TASK_TITLE" "green" $(( $(date +%s) - GREEN_START )) "$DEV_ATTEMPTS" "pass"
-        log "Running code health checks..."
-        run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON"
+        log "Code health (pre-refactor baseline):"
+        run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON" "pre-refactor"
         log "GREEN phase: PASS"
       else
         log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/3)"
@@ -1273,6 +1297,50 @@ $REFACTOR_FAILURES"
 
     echo "refactor-verified" > "$REFACTOR_VERIFIED_FILE"
     record_task_metrics "$TASK_ID" "$TASK_TITLE" "refactor" $(( $(date +%s) - REFACTOR_START )) 1 "pass"
+
+    # Post-refactor health check + delta vs baseline
+    log "Code health (post-refactor):"
+    run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON"
+
+    if [ -f "$TASK_DIR/health-report-pre.json" ] && [ -f "$TASK_DIR/health-report.json" ]; then
+      python3 - "$TASK_DIR/health-report-pre.json" "$TASK_DIR/health-report.json" \
+        "$PIPELINE_DIR/metrics.json" "$TASK_ID" <<'PYEOF'
+import json, sys
+pre  = json.load(open(sys.argv[1]))
+post = json.load(open(sys.argv[2]))
+metrics_file, task_id = sys.argv[3], sys.argv[4]
+
+deltas = []
+if pre.get('coverage_pct') is not None and post.get('coverage_pct') is not None:
+    d = round(post['coverage_pct'] - pre['coverage_pct'], 1)
+    if d != 0:
+        deltas.append(f"coverage {'↑' if d > 0 else '↓'}{abs(d)}%")
+if pre.get('duplication_pct') is not None and post.get('duplication_pct') is not None:
+    d = round(post['duplication_pct'] - pre['duplication_pct'], 1)
+    if d != 0:
+        deltas.append(f"dup {'↓' if d < 0 else '↑'}{abs(d)}%")
+pre_cx  = len(pre.get('complex_functions', []))
+post_cx = len(post.get('complex_functions', []))
+if pre_cx != post_cx:
+    deltas.append(f"complex fns {pre_cx}→{post_cx}")
+
+summary = ' · '.join(deltas) if deltas else 'no measurable change'
+print(f'  Refactor delta: {summary}')
+
+# Store delta in metrics for health-summary.md
+try:
+    import os as _os
+    if _os.path.exists(metrics_file):
+        data = json.load(open(metrics_file))
+        if task_id in data.get('tasks', {}):
+            data['tasks'][task_id]['health_delta'] = summary
+            with open(metrics_file, 'w') as fp:
+                json.dump(data, fp, indent=2)
+except Exception:
+    pass
+PYEOF
+    fi
+
     log "REFACTOR phase: PASS"
   else
     log "REFACTOR phase already complete — skipping"
@@ -1422,6 +1490,69 @@ for f in json.loads(sys.argv[1]):
 
   log "Task $TASK_ID: COMPLETE"
 done
+
+# ── Health summary report ─────────────────────────────────────────────────────
+python3 - "$PIPELINE_DIR/metrics.json" "$PIPELINE_DIR/health-summary.md" \
+  "$PHASE" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" <<'PYEOF'
+import json, os, sys
+
+metrics_file, output_file, phase, timestamp = \
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+if not os.path.exists(metrics_file):
+    sys.exit(0)
+
+data = json.load(open(metrics_file))
+tasks = data.get('tasks', {})
+if not tasks:
+    sys.exit(0)
+
+def fmt(v, suffix='%'):
+    return f"{v}{suffix}" if v is not None else '—'
+
+rows = []
+for tid, t in tasks.items():
+    h = t.get('health', {})
+    rows.append({
+        'id':    tid,
+        'title': t.get('title', tid)[:35],
+        'cov':   fmt(h.get('coverage_pct')),
+        'dup':   fmt(h.get('duplication_pct')),
+        'cx':    str(h.get('complex_fn_count', 0)) if 'complex_fn_count' in h else '—',
+        'delta': t.get('health_delta', '—'),
+    })
+
+covs = [t.get('health', {}).get('coverage_pct') for t in tasks.values()
+        if t.get('health', {}).get('coverage_pct') is not None]
+dups = [t.get('health', {}).get('duplication_pct') for t in tasks.values()
+        if t.get('health', {}).get('duplication_pct') is not None]
+total_cx = sum(t.get('health', {}).get('complex_fn_count', 0) for t in tasks.values())
+avg_cov = fmt(round(sum(covs) / len(covs), 1)) if covs else '—'
+avg_dup = fmt(round(sum(dups) / len(dups), 1)) if dups else '—'
+
+lines = [
+    f"# Phase {phase} — Code Health Summary",
+    f"",
+    f"*Generated {timestamp}*",
+    f"",
+    f"| Task | Coverage | Duplication | Complex Fns | Refactor delta |",
+    f"|---|---|---|---|---|",
+]
+for r in rows:
+    lines.append(
+        f"| {r['id']} — {r['title']} | {r['cov']} | {r['dup']} | {r['cx']} | {r['delta']} |"
+    )
+lines += [
+    f"| **Phase average** | **{avg_cov}** | **{avg_dup}** | **{total_cx} total** | |",
+    "",
+]
+
+open(output_file, 'w').write('\n'.join(lines))
+PYEOF
+
+if [ -f "$PIPELINE_DIR/health-summary.md" ]; then
+  log "Health summary written to pipeline/phase-$PHASE/health-summary.md"
+fi
 
 # ── AG-08 Validator ───────────────────────────────────────────────────────────
 log ""
