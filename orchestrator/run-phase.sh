@@ -46,6 +46,7 @@ fi
 
 mkdir -p "$PIPELINE_DIR"
 PHASE_STARTED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+CONTEXT_MAX_CHARS=4000  # max context.md chars injected into agent prompts (~1k tokens)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -127,12 +128,28 @@ report_passes() {
   grep -qE "(Title:|##? .+).*— PASS" "$file" 2>/dev/null
 }
 
-# Returns the accumulated build context for this phase if any tasks have completed.
+# Returns accumulated build context, capped at CONTEXT_MAX_CHARS (most recent tasks).
 # Output is empty if no context exists yet (first task in phase).
 build_context_block() {
-  if [ -f "$PIPELINE_DIR/context.md" ] && [ -s "$PIPELINE_DIR/context.md" ]; then
-    printf "## Context from completed tasks in this phase\n\n%s\n" "$(cat "$PIPELINE_DIR/context.md")"
+  local context_file="$PIPELINE_DIR/context.md"
+  [ -f "$context_file" ] && [ -s "$context_file" ] || return 0
+
+  local content
+  content=$(cat "$context_file")
+
+  if [ ${#content} -gt "$CONTEXT_MAX_CHARS" ]; then
+    content=$(python3 -c "
+import sys
+content = sys.stdin.read()
+tail = content[-$CONTEXT_MAX_CHARS:]
+idx = tail.find('\n## ')
+if idx > 0:
+    tail = tail[idx+1:]
+print('*(Earlier tasks omitted — see context.md for full history)*\n\n' + tail)
+" <<< "$content")
   fi
+
+  printf "## Context from completed tasks in this phase\n\n%s\n" "$content"
 }
 
 # Appends one phase entry to pipeline/phase-N/metrics.json (creates file if absent).
@@ -208,6 +225,46 @@ ${out}
   [ -z "$failures" ]
 }
 
+# Checks that all git-modified and new files (excluding pipeline/ and __tests__/)
+# are listed in files_in_scope_json. Prints violating paths, returns 1 if any found.
+check_scope_compliance() {
+  local files_in_scope_json="$1"
+  local violations=""
+
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    [[ "$f" == pipeline/* ]] && continue
+    [[ "$f" == *__tests__* ]] && continue
+    local in_scope
+    in_scope=$(python3 -c "
+import json, sys
+print('yes' if sys.argv[2] in json.loads(sys.argv[1]) else 'no')
+" "$files_in_scope_json" "$f" 2>/dev/null)
+    [ "$in_scope" = "no" ] && violations+="$f"$'\n'
+  done < <(
+    git -C "$REPO_ROOT" diff --name-only HEAD 2>/dev/null
+    git -C "$REPO_ROOT" ls-files --others --exclude-standard "$REPO_ROOT" 2>/dev/null \
+      | sed "s|$REPO_ROOT/||"
+  )
+
+  [ -z "$violations" ] && return 0
+  printf "%s" "$violations"
+  return 1
+}
+
+# Reverts files returned by check_scope_compliance (tracked = git checkout, new = rm).
+revert_scope_violations() {
+  while IFS= read -r vf; do
+    [[ -z "$vf" ]] && continue
+    if git -C "$REPO_ROOT" ls-files --error-unmatch "$vf" 2>/dev/null; then
+      git -C "$REPO_ROOT" checkout HEAD -- "$vf"
+    else
+      rm -f "$REPO_ROOT/$vf"
+    fi
+    log "  Reverted out-of-scope: $vf"
+  done
+}
+
 # ── Phase gate ────────────────────────────────────────────────────────────────
 if [ "$PHASE" -gt 1 ]; then
   PREV_PHASE=$(( PHASE - 1 ))
@@ -231,9 +288,48 @@ log "========================================"
 log ""
 log "AG-01 Architect — producing task manifest..."
 
+# Tiered context: extract only the relevant phase section and its epics from the PRD
+PHASE_PRD_CONTENT=$(python3 - "$REPO_ROOT/docs/prd.md" "$PHASE" <<'PYEOF'
+import re, sys
+try:
+    content = open(sys.argv[1]).read()
+except FileNotFoundError:
+    print("(docs/prd.md not found — create it before running the pipeline)")
+    sys.exit(0)
+phase_num = sys.argv[2]
+phase_match = re.search(
+    rf'(## Phase {phase_num}[^\n]*\n.*?)(?=\n## Phase \d+|\Z)',
+    content, re.DOTALL
+)
+phase_section = phase_match.group(1) if phase_match else ''
+epics = list(dict.fromkeys(re.findall(r'EP-\d+', phase_section)))
+stories = []
+for ep in epics:
+    m = re.search(rf'(### {ep}[^\n]*\n.*?)(?=\n### |\n---|\Z)', content, re.DOTALL)
+    if m:
+        stories.append(m.group(1))
+result = phase_section
+if stories:
+    result += '\n\n## User stories for this phase\n\n' + '\n\n'.join(stories)
+print(result.strip() if result.strip() else content)
+PYEOF
+)
+
+ARCH_DOC=$(cat "$REPO_ROOT/docs/architecture.md" 2>/dev/null \
+  || echo "(docs/architecture.md not found — create it before running the pipeline)")
+
 ARCH_PROMPT="You are running as AG-01 Architect for {PROJECT_NAME}.
 
-Read the PRD at docs/prd.md and the Architecture doc at docs/architecture.md.
+Here is the PRD content for Phase $PHASE:
+<prd-phase>
+$PHASE_PRD_CONTENT
+</prd-phase>
+
+Here is the Architecture document:
+<architecture>
+$ARCH_DOC
+</architecture>
+
 Produce the task manifest for Phase $PHASE.
 
 Write two files to pipeline/phase-$PHASE/:
@@ -508,8 +604,22 @@ $GATE_FAILURES"
         halt "Developer blocked on $TASK_ID" "AG-04" "$(cat "$TASK_DIR/BLOCKED.md")"
       fi
 
+      log "Checking files_in_scope compliance..."
+      SCOPE_VIOLATIONS=$(check_scope_compliance "$FILES_IN_SCOPE_JSON") || true
+      SCOPE_GATE=""
+      if [ -n "$SCOPE_VIOLATIONS" ]; then
+        log "Scope violation — reverting out-of-scope changes..."
+        revert_scope_violations <<< "$SCOPE_VIOLATIONS"
+        SCOPE_GATE="=== files_in_scope violation (changes reverted) ===
+The following files were modified or created outside files_in_scope and have been automatically reverted.
+Do NOT re-create or modify them — only write to files listed in files_in_scope:
+$SCOPE_VIOLATIONS"
+      fi
+
       log "Running hard gate (tsc + eslint + pnpm test)..."
-      GATE_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
+      IMPL_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
+      GATE_FAILURES="${SCOPE_GATE:+$SCOPE_GATE
+}${IMPL_FAILURES}"
 
       if [ -z "$GATE_FAILURES" ]; then
         GREEN_PASSED=true
@@ -688,8 +798,20 @@ Use process.env.DATABASE_URL for any database connections."
       run_agent "ag-04-developer" "$SEC_FIX_PROMPT" \
         "$TASK_DIR/dev-secfix-$SECURITY_ATTEMPTS.md"
 
+      SCOPE_VIOLATIONS=$(check_scope_compliance "$FILES_IN_SCOPE_JSON") || true
+      if [ -n "$SCOPE_VIOLATIONS" ]; then
+        log "Scope violation after security fix — reverting..."
+        revert_scope_violations <<< "$SCOPE_VIOLATIONS"
+      fi
+
       log "Re-running hard gate after security fix..."
       POST_SEC_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
+      if [ -n "$SCOPE_VIOLATIONS" ]; then
+        POST_SEC_FAILURES="=== files_in_scope violation after security fix ===
+$SCOPE_VIOLATIONS
+
+${POST_SEC_FAILURES}"
+      fi
       if [ -n "$POST_SEC_FAILURES" ]; then
         rm -f "$GREEN_VERIFIED_FILE" "$REFACTOR_VERIFIED_FILE"
         halt "Security fix broke tsc or tests on task $TASK_ID" "AG-07" \
