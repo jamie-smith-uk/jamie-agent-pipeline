@@ -1406,7 +1406,9 @@ Use process.env.DATABASE_URL for any database connections."
 
       log "Re-running hard gate after security fix..."
       POST_SEC_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
-      if [ -n "$SCOPE_VIOLATIONS" ]; then
+      # Only include scope violations in failures if tsc/lint/tests also failed.
+      # Scope violations alone are auto-recoverable via revert and shouldn't halt.
+      if [ -n "$POST_SEC_FAILURES" ] && [ -n "$SCOPE_VIOLATIONS" ]; then
         POST_SEC_FAILURES="=== files_in_scope violation after security fix ===
 $SCOPE_VIOLATIONS
 
