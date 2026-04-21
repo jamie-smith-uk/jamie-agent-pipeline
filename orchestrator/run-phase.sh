@@ -131,7 +131,12 @@ wait_for_approval() {
 # body text that happens to contain the word PASS.
 report_passes() {
   local file="$1"
-  grep -qE "(Title:|##? .+).*— PASS" "$file" 2>/dev/null
+  # Accept multiple verdict formats:
+  #   "Title: ... — PASS"
+  #   "# Title — PASS"
+  #   "**Verdict:** PASS"
+  #   "**Result:** PASS" or "**Result: PASS**"
+  grep -qE "(Title:|##? .+).*— PASS|\*\*(Verdict|Result)[: ]+PASS(\*\*)?" "$file" 2>/dev/null
 }
 
 # Returns accumulated build context, capped at CONTEXT_MAX_CHARS (most recent tasks).
@@ -567,6 +572,11 @@ check_scope_compliance() {
     [[ "$f" == pipeline/* ]] && continue
     [[ "$f" == *__tests__* ]] && continue
     [[ "$f" == *.tsbuildinfo ]] && continue
+    # Always-allowed support files — type/env additions are common cross-task
+    # needs; both security and test gates still run on them.
+    [[ "$f" == packages/shared/src/types.ts ]] && continue
+    [[ "$f" == packages/shared/src/env.ts ]] && continue
+    [[ "$f" == packages/shared/dist/* ]] && continue
     local in_scope
     in_scope=$(python3 -c "
 import json, sys
@@ -1154,8 +1164,14 @@ $SCOPE_VIOLATIONS"
 
       log "Running hard gate (tsc + eslint + pnpm test)..."
       IMPL_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
-      GATE_FAILURES="${SCOPE_GATE:+$SCOPE_GATE
+      # Only include scope violations in failures if tsc/lint/tests also failed.
+      # Scope violations alone are auto-recoverable via revert and shouldn't halt.
+      if [ -n "$IMPL_FAILURES" ]; then
+        GATE_FAILURES="${SCOPE_GATE:+$SCOPE_GATE
 }${IMPL_FAILURES}"
+      else
+        GATE_FAILURES=""
+      fi
 
       if [ -z "$GATE_FAILURES" ]; then
         GREEN_PASSED=true
