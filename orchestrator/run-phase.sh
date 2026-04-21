@@ -4,7 +4,7 @@ set -euo pipefail
 
 # ── {PROJECT_NAME} Pipeline Runner ───────────────────────────────────────────
 # Usage: ./orchestrator/run-phase.sh --phase 1
-# Requires: opencode CLI, ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_ID
+# Requires: opencode CLI, ANTHROPIC_API_KEY
 
 # ── Args ─────────────────────────────────────────────────────────────────────
 PHASE=""
@@ -35,8 +35,6 @@ fi
 
 # ── Validate required env vars ────────────────────────────────────────────────
 : "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is not set — check your .env}"
-: "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is not set — check your .env}"
-: "${TELEGRAM_ALLOWED_CHAT_ID:?TELEGRAM_ALLOWED_CHAT_ID is not set — check your .env}"
 
 # Construct DATABASE_URL from individual vars if not already set
 if [ -z "${DATABASE_URL:-}" ]; then
@@ -66,17 +64,10 @@ halt() {
 
 $detail
 EOF
-  telegram_notify "❌ Pipeline halted — Phase $PHASE\n\nReason: $reason\nAgent: $agent\n\nSee HALT.md for detail."
-  log "PIPELINE HALTED: $reason"
+  printf "\a"  # terminal bell
+  log "PIPELINE HALTED: $reason (agent: $agent)"
+  log "See HALT.md for full detail."
   exit 1
-}
-
-telegram_notify() {
-  local message="$1"
-  curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" \
-    -d "text=${message}" \
-    -d "parse_mode=Markdown" > /dev/null
 }
 
 run_agent() {
@@ -111,30 +102,25 @@ with open(f, 'w') as fp:
 }
 
 wait_for_approval() {
-  local approval_file="$PIPELINE_DIR/approval.json"
-  local deadline=$(( $(date +%s) + 86400 )) # 24 hours
+  local summary_file="$PIPELINE_DIR/reviewer-summary.md"
 
-  log "========================================" >&2
-  log "HUMAN GATE — review the manifest above" >&2
-  log "To approve:  ./orchestrator/approve.sh --phase $PHASE" >&2
-  log "To stop:     ./orchestrator/approve.sh --phase $PHASE --stop" >&2
-  log "To request changes: ./orchestrator/approve.sh --phase $PHASE --changes \"describe changes\"" >&2
-  log "========================================" >&2
-
-  # Wait for approval.json to appear (written by approve.sh or manually)
-  while [ $(date +%s) -lt $deadline ]; do
-    if [ -f "$approval_file" ]; then
-      local signal
-      signal=$(python3 -c "import json; print(json.load(open('$approval_file'))['signal'])")
-      log "Approval received: $signal" >&2
-      echo "$signal"
-      return 0
+  # Print summary and prompt to stderr so they're visible even inside $()
+  {
+    echo ""
+    echo "════════════════════════════════════════════════════════"
+    echo "  MANIFEST REVIEW — Phase $PHASE"
+    echo "════════════════════════════════════════════════════════"
+    if [ -f "$summary_file" ]; then
+      cat "$summary_file"
     fi
-    sleep 2
-  done
+    echo ""
+    echo "  approve  |  changes: [what to change]  |  stop"
+    printf "  > "
+  } >&2
 
-  kill $GATE_PID 2>/dev/null || true
-  halt "Approval timeout" "human-gate" "No approval signal received within 24 hours"
+  local response
+  read -r response
+  echo "$response"
 }
 
 # Checks that a report file contains a PASS title line as written by the agents.
@@ -215,8 +201,10 @@ run_mutation_tests() {
 
     # Find first line matching a security-critical pattern (priority order)
     local line_num=""
-    for pat in "TELEGRAM_ALLOWED_CHAT_ID" "chat_id" '\$[0-9]' \
-               "validateInput\|isValid\|sanitize\|whitelist"; do
+    for pat in "ALLOWED_CHAT_ID\|allowed_chat\|whitelist" \
+               "authenticate\|authorize\|isAuthorized" \
+               '\$[0-9]' \
+               "validateInput\|isValid\|sanitize"; do
       line_num=$(grep -nm1 "$pat" "$full" 2>/dev/null | cut -d: -f1 || true)
       [[ -n "$line_num" ]] && break
     done
@@ -878,7 +866,7 @@ Read pipeline/phase-$PHASE/task-manifest.json and pipeline/phase-$PHASE/manifest
 
 Write reviewer-summary.md to pipeline/phase-$PHASE/ using the format defined in your system prompt.
 
-Do not send any Telegram messages. Do not make any API calls. Just write the file and stop."
+Do not make any API calls. Just write the file and stop."
 
 if [ -n "$AC_ISSUES" ]; then
   REVIEW_PROMPT="$REVIEW_PROMPT
@@ -889,29 +877,12 @@ fi
 
 run_agent "ag-02-reviewer" "$REVIEW_PROMPT" "$PIPELINE_DIR/ag02-output.md"
 
-# Read the reviewer summary and send it via Telegram
 SUMMARY_FILE="$PIPELINE_DIR/reviewer-summary.md"
 if [ ! -f "$SUMMARY_FILE" ]; then
   halt "reviewer-summary.md not produced" "AG-02" "Reviewer did not write the summary file"
 fi
 
-SUMMARY_TEXT=$(head -c 3000 "$SUMMARY_FILE")
-
-curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-  --data-urlencode "text=🔍 {PROJECT_NAME} Pipeline — Phase ${PHASE} Review
-
-${SUMMARY_TEXT}
-
-Reply with: approve | changes: [what to change] | stop" \
-  -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" > /dev/null
-
-log "Reviewer summary sent to Telegram"
-
 # ── Human gate ────────────────────────────────────────────────────────────────
-log ""
-log "========================================"
-log "HUMAN GATE — waiting for your reply..."
-log "========================================"
 
 APPROVAL=$(wait_for_approval)
 
@@ -951,7 +922,7 @@ Also read the previous pipeline/phase-$PHASE/reviewer-summary.md to identify wha
 Write a revised reviewer-summary.md to pipeline/phase-$PHASE/ using the revision format from
 your system prompt — put the 'What changed' section first, then the standard summary.
 
-Do not send any Telegram messages. Do not make any API calls. Just write the file and stop."
+Do not make any API calls. Just write the file and stop."
 
   run_agent "ag-02-reviewer" "$REVIEW_PROMPT_REVISED" "$PIPELINE_DIR/ag02-output-revised-$REVISION.md"
 
@@ -959,17 +930,6 @@ Do not send any Telegram messages. Do not make any API calls. Just write the fil
   if [ ! -f "$SUMMARY_FILE" ]; then
     halt "reviewer-summary.md not produced on revision" "AG-02" "Reviewer did not write the summary file"
   fi
-  SUMMARY_TEXT=$(head -c 3000 "$SUMMARY_FILE")
-  curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    --data-urlencode "text=🔄 {PROJECT_NAME} Pipeline — Phase ${PHASE} Review (Revision ${REVISION})
-
-${SUMMARY_TEXT}
-
-Reply with: approve | changes: [what to change] | stop" \
-    -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" > /dev/null
-  log "Revised reviewer summary (revision $REVISION) sent to Telegram"
-
-  rm -f "$PIPELINE_DIR/approval.json"
   APPROVAL=$(wait_for_approval)
 
   if [ "$APPROVAL" = "stop" ]; then
@@ -1593,26 +1553,18 @@ On FAIL:
 - List exactly which exit criteria failed and why
 - Do not create a git tag
 
-Do not send any Telegram messages. The shell script handles notifications."
+Follow your system prompt exactly."
 
   run_agent "ag-08-validator" "$VAL_PROMPT" "$PIPELINE_DIR/val-output.md"
 
   if [ -f "$PIPELINE_DIR/validation-report.md" ] && report_passes "$PIPELINE_DIR/validation-report.md"; then
     VALIDATION_PASSED=true
 
-    # Send Telegram notification on phase PASS
-    VAL_TEXT=$(head -c 3000 "$PIPELINE_DIR/validation-report.md")
-    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-      --data-urlencode "text=✅ {PROJECT_NAME} — Phase ${PHASE} Complete
-
-${VAL_TEXT}" \
-      -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" > /dev/null
-
+    printf "\a"  # terminal bell
     log ""
     log "========================================"
-    log "Phase $PHASE: COMPLETE"
+    log "✅ Phase $PHASE: COMPLETE"
     log "Git tag: phase-$PHASE-complete created"
-    log "Telegram notification sent"
     log "========================================"
   else
     log "Validation: FAIL (attempt $VALIDATION_ATTEMPTS/2)"

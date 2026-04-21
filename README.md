@@ -9,7 +9,7 @@ Eight specialised AI agents that build software from a PRD and architecture docu
 | Agent | Role |
 |---|---|
 | AG-01 Architect | Breaks the PRD phase into an ordered task manifest with explicit acceptance criteria |
-| AG-02 Reviewer | Presents the plan for human approval via Telegram before any code is written |
+| AG-02 Reviewer | Presents the plan for human approval in the terminal before any code is written |
 | AG-03 Tester | Writes failing tests first (RED phase) — tests define the contract |
 | AG-04 Developer | Implements code to make the tests pass (GREEN phase) |
 | AG-05 Migration | Validates and runs DB migrations, checks reversibility (conditional) |
@@ -47,7 +47,7 @@ git clone https://github.com/jamie-smith-uk/jamie-agent-pipeline
 cd /path/to/project && ./orchestrator/run-phase.sh --phase 1
 ```
 
-`setup-pipeline.sh` will prompt for your Telegram bot token, chat ID, and Anthropic API key, then write `.env`.
+`setup-pipeline.sh` will prompt for your Anthropic API key and write `.env`.
 
 ## Updating an existing project
 
@@ -59,7 +59,6 @@ cd /path/to/project && ./orchestrator/run-phase.sh --phase 1
 
 - opencode CLI
 - Anthropic API key
-- Telegram bot token and chat ID (see @BotFather)
 - Node.js 20, pnpm, Python 3
 
 ## Pipeline output
@@ -109,7 +108,7 @@ See `docs/best-practices.md` for the full rationale. Key decisions:
 ```
 .opencode/agents/    agent system prompts (ag-01 through ag-08)
 .opencode/rules/     opencode rules loaded every session
-orchestrator/        run-phase.sh, telegram-gate.sh, setup-pipeline.sh, sync-pipeline.sh
+orchestrator/        run-phase.sh, run-task.sh, setup-pipeline.sh, sync-pipeline.sh, check-pipeline.sh
 docs/templates/      PRD, architecture, env, and smoke test templates
 docs/                best-practices.md, pipeline documentation
 CLAUDE.md            context file for Claude Code sessions in this repo

@@ -1,5 +1,5 @@
 ---
-description: End-to-end validation of the full phase against PRD exit criteria. Runs smoke tests. Signs off the phase or returns specific failures. Creates Git tag and sends Telegram notification on PASS.
+description: End-to-end validation of the full phase against PRD exit criteria. Runs smoke tests. Signs off the phase or returns specific failures. Creates Git tag on PASS.
 mode: subagent
 model: anthropic/claude-sonnet-4-20250514
 temperature: 0.1
@@ -44,12 +44,10 @@ FAIL format:
 
 ## On PASS
 - Create a Git tag: git tag phase-N-complete
-- Send a Telegram notification to the user with the changelog and confirmation that the phase is complete
-- Write the validation-report.md
+- Write the validation-report.md (the orchestrator prints completion to the terminal)
 
 ## On FAIL
 - Do not create a Git tag
-- Do not send a Telegram notification
 - Write the validation-report.md with precise failure detail
 - Maximum 2 cycles per phase. If the phase cannot be validated in 2 attempts, write a HALT note and the orchestrator will pause the pipeline.
 

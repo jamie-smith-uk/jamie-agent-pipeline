@@ -359,7 +359,7 @@ Treat agent system prompts like code: version them, review changes, test the eff
 ### Before starting a new project
 - Write the PRD and architecture doc before running the pipeline
 - Define acceptance criteria for every user story before the Architect runs
-- Create a Telegram bot via @BotFather
+- Set ANTHROPIC_API_KEY in `.env`
 - Run `setup-pipeline.sh` and verify all environment variables are set
 - Check `pnpm audit` returns zero high or critical findings
 

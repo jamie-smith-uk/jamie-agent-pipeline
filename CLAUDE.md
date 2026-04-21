@@ -6,7 +6,7 @@ A reusable AI agent pipeline for building software projects. This is the **templ
 
     .opencode/agents/    agent system prompts (ag-01 through ag-08, numbered in execution order)
     .opencode/rules/     opencode rules loaded every session (security, typescript)
-    orchestrator/        run-phase.sh, telegram-gate.sh, setup-pipeline.sh, sync-pipeline.sh
+    orchestrator/        run-phase.sh, run-task.sh, setup-pipeline.sh, sync-pipeline.sh, check-pipeline.sh
     docs/templates/      PRD, architecture, env, and smoke test templates for new projects
     docs/                pipeline documentation (best-practices.md)
 
@@ -37,4 +37,4 @@ Use `{PROJECT_NAME}` and `{project-name}` as placeholders in all agent files and
 
 ## Running locally
 
-Requires: opencode CLI, Anthropic API key, Telegram bot token and chat ID. See `docs/best-practices.md` for design rationale.
+Requires: opencode CLI, Anthropic API key. See `docs/best-practices.md` for design rationale.

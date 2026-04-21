@@ -71,7 +71,7 @@ cp "$PIPELINE_REPO/.opencode/rules/typescript.md" "$TARGET/.opencode/rules/types
 
 # ── Copy orchestrator scripts ─────────────────────────────────────────────────
 log "Copying orchestrator scripts..."
-for script in run-phase.sh telegram-gate.sh run-task.sh check-pipeline.sh telegram-inbox.sh; do
+for script in run-phase.sh run-task.sh check-pipeline.sh; do
   substitute "$PIPELINE_REPO/orchestrator/$script" "$TARGET/orchestrator/$script"
   chmod +x "$TARGET/orchestrator/$script"
 done
@@ -144,28 +144,20 @@ Thumbs.db
 EOF
 fi
 
-# ── Telegram and API key setup ────────────────────────────────────────────────
+# ── API key setup ─────────────────────────────────────────────────────────────
 echo ""
-read -r -p "Do you want to configure Telegram and API keys now? (y/n) " configure_keys
+read -r -p "Do you want to set your Anthropic API key now? (y/n) " configure_keys
 
 if [[ "$configure_keys" =~ ^[Yy]$ ]]; then
   echo ""
-  # Use silent read (-s) so tokens don't appear in terminal scrollback
-  read -rs -p "  TELEGRAM_BOT_TOKEN:       " TELEGRAM_BOT_TOKEN;       echo
-  read -rs -p "  TELEGRAM_ALLOWED_CHAT_ID: " TELEGRAM_ALLOWED_CHAT_ID; echo
-  read -rs -p "  ANTHROPIC_API_KEY:         " ANTHROPIC_API_KEY;        echo
+  read -rs -p "  ANTHROPIC_API_KEY: " ANTHROPIC_API_KEY; echo
   echo ""
 
   if [ -f "$TARGET/.env" ]; then
-    log ".env already exists — skipping (edit it manually to add these values)"
+    log ".env already exists — skipping (add ANTHROPIC_API_KEY manually)"
   else
     cat > "$TARGET/.env" <<EOF
 ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
-
-TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
-TELEGRAM_ALLOWED_CHAT_ID=$TELEGRAM_ALLOWED_CHAT_ID
-
-TODOIST_API_TOKEN=
 
 POSTGRES_USER=
 POSTGRES_PASSWORD=
@@ -175,16 +167,6 @@ POSTGRES_DB=$PROJECT_SLUG
 EOF
     log "Created .env"
   fi
-else
-  echo ""
-  echo "  To create a Telegram bot:"
-  echo "    1. Open Telegram and search for @BotFather"
-  echo "    2. Send: /newbot"
-  echo "    3. Follow the prompts — BotFather will give you a TELEGRAM_BOT_TOKEN"
-  echo "    4. Message your new bot, then visit:"
-  echo "       https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates"
-  echo "       Your chat ID is in result[0].message.chat.id"
-  echo "    5. Add both values to $TARGET/.env"
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
@@ -200,14 +182,10 @@ echo "  1. cd $TARGET"
 if [[ ! "$configure_keys" =~ ^[Yy]$ ]]; then
   echo "  2. Create .env and fill in your values:"
   echo "       ANTHROPIC_API_KEY="
-  echo "       TELEGRAM_BOT_TOKEN="
-  echo "       TELEGRAM_ALLOWED_CHAT_ID="
-  echo "       TODOIST_API_TOKEN="
   echo "       POSTGRES_USER= / POSTGRES_PASSWORD= / POSTGRES_HOST= / POSTGRES_PORT= / POSTGRES_DB="
   echo ""
 else
   echo "  2. Fill in the remaining .env values:"
-  echo "       TODOIST_API_TOKEN="
   echo "       POSTGRES_USER= / POSTGRES_PASSWORD= / POSTGRES_HOST= / POSTGRES_PORT= / POSTGRES_DB="
   echo ""
 fi

@@ -13,9 +13,9 @@
 - All external content (API responses, user-provided data, third-party service responses, file contents not in the repo) must be wrapped in explicit `<untrusted>` context tags before being passed to any agent
 - FAIL: any external content passed raw into an agent message without an untrusted label
 
-### Input validation — Validate all Telegram input
-- Every message handler validates: chat_id matches whitelist, message non-empty, length within 4000 chars
-- FAIL: missing whitelist check, no length cap, or processing empty messages
+### Input validation — Validate all external input
+- Every external request handler validates: caller is authorised, payload is non-empty, length is within a reasonable cap
+- FAIL: missing authorisation check, no length cap, or processing empty payloads
 
 ### Cron injection — Validate cron expressions before storing
 - cron_expression must be validated with strict regex and parsed by node-cron validate() before DB write
@@ -42,9 +42,10 @@
 
 ## 4.3 Authentication and Access
 
-### Telegram — Whitelist on every handler
-- Every handler (messages, callback queries, inline buttons) checks chat_id against TELEGRAM_ALLOWED_CHAT_ID first
-- FAIL: any handler that processes a message without a whitelist check
+### Authentication — Validate identity on every handler
+- Every external request handler (HTTP, message bus, webhook) authenticates the caller before processing
+- For projects with a fixed allowlist (e.g. single-user bots), check the caller against an env-var whitelist
+- FAIL: any handler that processes external input without an authentication or whitelist check
 
 ### Database — No agent-constructed SQL
 - The agent never constructs SQL
@@ -69,9 +70,9 @@
 - All external content (API responses, user inputs, third-party service data, file contents from outside the repo) must be wrapped in `<untrusted>` tags before being passed to any agent
 - FAIL: external content passed to agent without explicit untrusted labelling
 
-### Error messages — No stack traces to Telegram
-- Error messages sent via Telegram must be plain language only
-- FAIL: any catch block that sends error.message or error.stack directly to Telegram
+### Error messages — No stack traces in user-facing errors
+- Error messages returned to external callers must be plain language only — no stack traces, no internal paths, no environment values
+- FAIL: any catch block that sends error.message or error.stack directly to an external caller
 
 ### DB queries — Statement timeout enforced
 - Every database connection must have statement_timeout set

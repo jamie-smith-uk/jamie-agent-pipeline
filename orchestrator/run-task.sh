@@ -41,7 +41,7 @@ Inputs (one required):
   --json '{...}'            Inline task JSON
 
 Options:
-  --review       Send task spec to Telegram for approval before running
+  --review       Show task spec in terminal and ask for approval before running
   --no-security  Skip AG-07 Security (for non-code changes, docs, config)
   --urgent       Skip Refactor and Mutation testing (hotfix mode)
   --dry-run      Print the manifest and exit without running agents
@@ -71,8 +71,6 @@ if [ -f "$REPO_ROOT/.env" ]; then
 fi
 
 : "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is not set — check your .env}"
-: "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is not set — check your .env}"
-: "${TELEGRAM_ALLOWED_CHAT_ID:?TELEGRAM_ALLOWED_CHAT_ID is not set — check your .env}"
 
 if [ -z "${DATABASE_URL:-}" ] && [ -n "${POSTGRES_USER:-}" ]; then
   DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
@@ -249,62 +247,25 @@ log "========================================"
 log "Mode:$([ "$OPT_URGENT" = "true" ] && echo " URGENT") $([ "$OPT_NO_SECURITY" = "true" ] && echo " NO-SECURITY")"
 log "Dir:  $TASK_DIR"
 
-# ── Optional Telegram review gate ────────────────────────────────────────────
+# ── Optional review gate (terminal prompt) ───────────────────────────────────
 if [ "$OPT_REVIEW" = true ]; then
-  REVIEW_TEXT="🔍 {PROJECT_NAME} — Task Review
-
-*$TASK_TITLE*
-
-Files: $(python3 -c "import json,sys; print(', '.join(json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")
-Security sensitive: $SECURITY_SENSITIVE
-Criteria:
-$(python3 -c "import json,sys; [print(f'  • {c}') for c in json.loads(sys.argv[1]).get('acceptance_criteria',[])]" "$TASK_JSON")
-
-Reply: approve | stop"
-
-  curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    --data-urlencode "text=$REVIEW_TEXT" \
-    -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" > /dev/null
-
-  log "Task spec sent to Telegram — waiting for approval (1 hour timeout)..."
-
-  LAST_UPDATE_ID=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=1&offset=-1" \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('result',[]); print(r[-1]['update_id']+1 if r else 0)")
-
-  DEADLINE=$(( $(date +%s) + 3600 ))
-  APPROVED=false
-
-  while [ $(date +%s) -lt $DEADLINE ]; do
-    RESULT=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${LAST_UPDATE_ID}&timeout=10&allowed_updates=message" \
-      | python3 -c "
-import json,sys
-for u in json.load(sys.stdin).get('result',[]):
-    m=u.get('message',{})
-    if str(m.get('chat',{}).get('id',''))=='${TELEGRAM_ALLOWED_CHAT_ID}' and m.get('text','').strip():
-        print(f\"{u['update_id']}|{m['text'].strip().lower()}\")
-        break
-" 2>/dev/null)
-
-    if [ -n "$RESULT" ]; then
-      LAST_UPDATE_ID=$(( $(echo "$RESULT" | cut -d'|' -f1) + 1 ))
-      TEXT=$(echo "$RESULT" | cut -d'|' -f2-)
-      if [ "$TEXT" = "approve" ] || [ "$TEXT" = "yes" ]; then
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-          --data-urlencode "text=✅ Approved. Starting implementation..." \
-          -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" > /dev/null
-        APPROVED=true
-        break
-      elif [ "$TEXT" = "stop" ] || [ "$TEXT" = "no" ]; then
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-          --data-urlencode "text=🛑 Task stopped." \
-          -d "chat_id=${TELEGRAM_ALLOWED_CHAT_ID}" > /dev/null
-        log "Task stopped by user"
-        exit 0
-      fi
-    fi
-  done
-
-  [ "$APPROVED" = true ] || { log "No approval received within 1 hour — exiting"; exit 1; }
+  echo ""
+  echo "════════════════════════════════════════════════════════"
+  echo "  TASK REVIEW"
+  echo "════════════════════════════════════════════════════════"
+  echo "  Title:    $TASK_TITLE"
+  echo "  Files:    $(python3 -c "import json,sys; print(', '.join(json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")"
+  echo "  Security: $SECURITY_SENSITIVE"
+  echo ""
+  echo "  Criteria:"
+  python3 -c "import json,sys; [print(f'    • {c}') for c in json.loads(sys.argv[1]).get('acceptance_criteria',[])]" "$TASK_JSON"
+  echo ""
+  printf "  approve | stop > "
+  read -r REVIEW_RESPONSE
+  case "$REVIEW_RESPONSE" in
+    approve|yes|y) log "Approved — starting implementation..." ;;
+    *) log "Task stopped by user"; exit 0 ;;
+  esac
 fi
 
 # ── RED phase ─────────────────────────────────────────────────────────────────
@@ -576,12 +537,10 @@ else:
     print(f'{total}s')
 ")
 
+printf "\a"  # terminal bell
 log ""
 log "========================================"
-log "Task complete: $TASK_TITLE"
+log "✅ Task complete: $TASK_TITLE"
 log "Duration     : $TOTAL_S"
 log "Output       : $TASK_DIR"
 log "========================================"
-
-telegram_notify "✅ {PROJECT_NAME} — Task complete
-*$TASK_TITLE* ($TOTAL_S)"

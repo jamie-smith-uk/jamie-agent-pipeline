@@ -56,8 +56,6 @@ echo "Environment:"
 [ -f "$REPO_ROOT/.env" ] && ok ".env file exists" || warn ".env not found — run setup-pipeline.sh"
 
 [ -n "${ANTHROPIC_API_KEY:-}" ]       && ok "ANTHROPIC_API_KEY set"       || fail "ANTHROPIC_API_KEY not set"
-[ -n "${TELEGRAM_BOT_TOKEN:-}" ]      && ok "TELEGRAM_BOT_TOKEN set"      || fail "TELEGRAM_BOT_TOKEN not set"
-[ -n "${TELEGRAM_ALLOWED_CHAT_ID:-}" ] && ok "TELEGRAM_ALLOWED_CHAT_ID set" || fail "TELEGRAM_ALLOWED_CHAT_ID not set"
 [ -n "${POSTGRES_USER:-}" ]           && ok "POSTGRES_USER set"           || warn "POSTGRES_USER not set (needed for DB tasks)"
 [ -n "${DATABASE_URL:-}" ] || [ -n "${POSTGRES_HOST:-}" ] \
   && ok "Database config present" || warn "No database config (needed for DB tasks)"
@@ -81,21 +79,6 @@ fi
 [ -f "$REPO_ROOT/smoke-tests/phase-1.sh" ] \
   && ok "smoke-tests/phase-1.sh exists" \
   || warn "smoke-tests/phase-1.sh not found — AG-08 Validator will note its absence"
-
-# ── Telegram connectivity ─────────────────────────────────────────────────────
-echo ""
-echo "Telegram:"
-if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-  TELE_RESPONSE=$(curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>/dev/null || echo "")
-  if echo "$TELE_RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ok') else 1)" 2>/dev/null; then
-    BOT_NAME=$(echo "$TELE_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['result']['username'])" 2>/dev/null || echo "unknown")
-    ok "Bot token valid (@$BOT_NAME)"
-  else
-    fail "Bot token invalid or Telegram unreachable"
-  fi
-else
-  warn "Skipping Telegram check (TELEGRAM_BOT_TOKEN not set)"
-fi
 
 # ── Git state ─────────────────────────────────────────────────────────────────
 echo ""

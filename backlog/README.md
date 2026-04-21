@@ -44,7 +44,7 @@ exists before processing. Fix should be in the main handler entry point.
 # Standard run
 ./orchestrator/run-task.sh backlog/my-task.md
 
-# With Telegram approval gate first
+# With terminal approval gate first
 ./orchestrator/run-task.sh --review backlog/my-task.md
 
 # Hotfix — skip Refactor and Mutation testing
