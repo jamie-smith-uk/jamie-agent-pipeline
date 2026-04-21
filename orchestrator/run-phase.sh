@@ -521,9 +521,20 @@ for f in files:
 " "$files_in_scope_json" 2>/dev/null)
 
   if [ ${#existing_files[@]} -gt 0 ]; then
-    out=$(cd "$REPO_ROOT" && pnpm exec eslint "${existing_files[@]}" 2>&1); rc=$?
+    # Use biome if available (check root package.json), fall back to eslint
+    local linter="eslint"
+    if grep -q '"@biomejs/biome"' "$REPO_ROOT/package.json" 2>/dev/null; then
+      linter="biome"
+    fi
+
+    if [ "$linter" = "biome" ]; then
+      out=$(cd "$REPO_ROOT" && pnpm exec biome check "${existing_files[@]}" 2>&1); rc=$?
+    else
+      out=$(cd "$REPO_ROOT" && pnpm exec eslint "${existing_files[@]}" 2>&1); rc=$?
+    fi
+
     if [ $rc -ne 0 ]; then
-      failures+="=== eslint ===
+      failures+="=== $linter ===
 ${out}
 
 "
@@ -552,6 +563,7 @@ check_scope_compliance() {
     [[ -z "$f" ]] && continue
     [[ "$f" == pipeline/* ]] && continue
     [[ "$f" == *__tests__* ]] && continue
+    [[ "$f" == *.tsbuildinfo ]] && continue
     local in_scope
     in_scope=$(python3 -c "
 import json, sys
