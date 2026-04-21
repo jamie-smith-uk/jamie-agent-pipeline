@@ -247,25 +247,43 @@ log "========================================"
 log "Mode:$([ "$OPT_URGENT" = "true" ] && echo " URGENT") $([ "$OPT_NO_SECURITY" = "true" ] && echo " NO-SECURITY")"
 log "Dir:  $TASK_DIR"
 
-# ── Optional review gate (terminal prompt) ───────────────────────────────────
+# ── Optional review gate (file-based, works in both interactive and background) ─
 if [ "$OPT_REVIEW" = true ]; then
-  echo ""
-  echo "════════════════════════════════════════════════════════"
-  echo "  TASK REVIEW"
-  echo "════════════════════════════════════════════════════════"
-  echo "  Title:    $TASK_TITLE"
-  echo "  Files:    $(python3 -c "import json,sys; print(', '.join(json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")"
-  echo "  Security: $SECURITY_SENSITIVE"
-  echo ""
-  echo "  Criteria:"
+  REL_TASK_DIR="${TASK_DIR#$REPO_ROOT/}"
+  APPROVAL_FILE="$TASK_DIR/approval.json"
+  rm -f "$APPROVAL_FILE"
+
+  log "========================================"
+  log "  TASK REVIEW"
+  log "========================================"
+  log "  Title:    $TASK_TITLE"
+  log "  Files:    $(python3 -c "import json,sys; print(', '.join(json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")"
+  log "  Security: $SECURITY_SENSITIVE"
+  log ""
+  log "  Criteria:"
   python3 -c "import json,sys; [print(f'    • {c}') for c in json.loads(sys.argv[1]).get('acceptance_criteria',[])]" "$TASK_JSON"
-  echo ""
-  printf "  approve | stop > "
-  read -r REVIEW_RESPONSE
-  case "$REVIEW_RESPONSE" in
-    approve|yes|y) log "Approved — starting implementation..." ;;
-    *) log "Task stopped by user"; exit 0 ;;
-  esac
+  log ""
+  log "  To approve:  ./orchestrator/approve.sh --task $REL_TASK_DIR"
+  log "  To stop:     ./orchestrator/approve.sh --task $REL_TASK_DIR --stop"
+  log "========================================"
+
+  DEADLINE=$(( $(date +%s) + 86400 ))  # 24h
+  while [ $(date +%s) -lt $DEADLINE ]; do
+    if [ -f "$APPROVAL_FILE" ]; then
+      SIGNAL=$(python3 -c "import json; print(json.load(open('$APPROVAL_FILE'))['signal'])")
+      case "$SIGNAL" in
+        approve) log "Approved — starting implementation..."; break ;;
+        stop)    log "Task stopped by user"; exit 0 ;;
+        *)       log "Unknown approval signal: $SIGNAL"; exit 1 ;;
+      esac
+    fi
+    sleep 2
+  done
+
+  if [ ! -f "$APPROVAL_FILE" ]; then
+    log "Approval timeout — no signal received within 24h"
+    exit 1
+  fi
 fi
 
 # ── RED phase ─────────────────────────────────────────────────────────────────

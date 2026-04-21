@@ -126,7 +126,7 @@ log "  → .opencode/rules/typescript.md"
 log "Syncing orchestrator scripts..."
 mkdir -p "$TARGET/orchestrator"
 
-for script in run-phase.sh run-task.sh check-pipeline.sh; do
+for script in run-phase.sh run-task.sh check-pipeline.sh approve.sh; do
   substitute "$PIPELINE_REPO/orchestrator/$script" "$TARGET/orchestrator/$script"
   chmod +x "$TARGET/orchestrator/$script"
   log "  → orchestrator/$script"
