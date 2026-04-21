@@ -102,25 +102,28 @@ with open(f, 'w') as fp:
 }
 
 wait_for_approval() {
-  local summary_file="$PIPELINE_DIR/reviewer-summary.md"
+  local approval_file="$PIPELINE_DIR/approval.json"
+  local deadline=$(( $(date +%s) + 86400 )) # 24 hours
 
-  # Print summary and prompt to stderr so they're visible even inside $()
-  {
-    echo ""
-    echo "════════════════════════════════════════════════════════"
-    echo "  MANIFEST REVIEW — Phase $PHASE"
-    echo "════════════════════════════════════════════════════════"
-    if [ -f "$summary_file" ]; then
-      cat "$summary_file"
+  log "========================================" >&2
+  log "HUMAN GATE — review the manifest above" >&2
+  log "To approve:  ./orchestrator/approve.sh --phase $PHASE" >&2
+  log "To stop:     ./orchestrator/approve.sh --phase $PHASE --stop" >&2
+  log "To request changes: ./orchestrator/approve.sh --phase $PHASE --changes \"describe changes\"" >&2
+  log "========================================" >&2
+
+  while [ $(date +%s) -lt $deadline ]; do
+    if [ -f "$approval_file" ]; then
+      local signal
+      signal=$(python3 -c "import json; print(json.load(open('$approval_file'))['signal'])")
+      log "Approval received: $signal" >&2
+      echo "$signal"
+      return 0
     fi
-    echo ""
-    echo "  approve  |  changes: [what to change]  |  stop"
-    printf "  > "
-  } >&2
+    sleep 2
+  done
 
-  local response
-  read -r response
-  echo "$response"
+  halt "Approval timeout" "human-gate" "No approval signal received within 24 hours"
 }
 
 # Checks that a report file contains a PASS title line as written by the agents.
