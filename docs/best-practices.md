@@ -310,28 +310,33 @@ Treat agent system prompts like code: version them, review changes, test the eff
 ### What the pipeline does well
 
 - **Generator/evaluator separation** — Developer, Security, and Tester are distinct agents with distinct sessions and scoped permissions
-- **TDD first** — AG-03 Tester writes failing tests (RED) before AG-04 Developer implements (GREEN); orchestrator hard gate runs `tsc + eslint + pnpm test` directly, not via agent self-report
+- **TDD first** — AG-03 Tester writes failing tests (RED) before AG-04 Developer implements (GREEN); orchestrator hard gate runs `tsc + biome check + pnpm test` directly, not via agent self-report
 - **File-based state** — all pipeline artifacts persist between runs; the pipeline resumes from last checkpoint using sentinel files
 - **Atomic tasks** — Architect produces a manifest with explicit `files_in_scope`, `dependencies`, and testable `acceptance_criteria`
 - **Human gate at the right point** — approval required before implementation, with revision rounds and "What changed" summaries to combat approval fatigue
 - **Security as a hard gate** — AG-07 Security blocks the pipeline on FAIL with no bypass; security findings categorised and tracked in metrics
 - **Prompt injection defence** — all manifest content wrapped in `<task-spec>` tags; external content rules in security-rules.md use explicit `<untrusted>` labelling
-- **Scope enforcement** — `files_in_scope` violations automatically reverted after every Developer run
+- **Scope enforcement** — `files_in_scope` violations automatically reverted; false-GREEN guard detects zero in-scope changes after revert and forces retry
 - **Mutation testing** — security-sensitive tasks get mutation testing after GREEN to verify tests actually catch removed security checks
-- **Tiered context loading** — Architect receives only the relevant PRD phase section and its epics, not the full document
-- **Metrics** — per-task timing, retry counts, security finding categories, and high-retry signals written to `metrics.json`
+- **Tiered context loading** — Architect receives only the relevant PRD phase section, its epics, and a compact repo file tree
+- **Metrics** — per-task timing, retry counts, security finding categories, complexity scores, and high-retry signals written to `metrics.json`
 - **Resumability** — sentinel files per phase (tests-written, green-verified, refactor-verified, migration-verified) enable clean mid-task resume
+- **Anchored PASS detection** — `report_passes()` inspects only the first 10 lines of reports via Python — body text references cannot create false positives
+- **Strict manifest schema** — Architect prompt includes an explicit field list with allowed values; machine-validated before Reviewer runs
+- **Code health monitoring** — Biome JSON output parsed for `noExcessiveCognitiveComplexity` violations (threshold: 10); scores injected into AG-06 prompt as named targets; `jscpd` duplication and Vitest coverage tracked per task
+- **GitHub Actions support** — `ARCHITECT_ONLY=1` and `SKIP_ARCHITECT=1` flags split the phase into CI jobs; five workflow templates included
+- **PM agent** — AG-PM turns GitHub Issue briefs into structured PRD drafts via a conversational label-triggered workflow
+- **Validator fix loop** — on AG-08 FAIL, AG-04 Developer receives specific exit-criteria failures, fixes them, hard gate re-runs, then validator retries (up to 2 cycles)
+- **Security context continuity** — AG-07 and AG-04 security-fix prompts now receive `CONTEXT_BLOCK` and explicit `files_in_scope` list so agents know established patterns from earlier tasks
 
 ### Remaining gaps
 
 | Gap | Description |
 |---|---|
-| Code health monitoring | No cyclomatic complexity, duplication detection, or test coverage tracked over time. The Refactor agent uses judgment, not measurement. |
 | Trajectory evaluation | Pipeline checks end-state (did it write PASS?) but not trajectory (did it take the right actions in the right order?). |
-| Architecture doc tiering | The full architecture doc is still injected into Architect prompts — same tiering applied to the PRD in v1.2 should extend here. |
+| Architecture doc tiering | The full architecture doc is still injected into Architect prompts — the same tiering applied to the PRD should extend here. |
 | pass@1 rate | `attempts` is tracked per phase but first-attempt pass rate is not computed as a percentage across all tasks. |
-| Task-manifest schema validation | AG-01 output is loosely parsed — not validated against a JSON schema before the Reviewer runs. |
-| LLM judge for acceptance criteria | Regex-based quality gate (v1.3) misses nuanced non-testability. A model-based grader would be more accurate. |
+| LLM judge for acceptance criteria | Regex-based quality gate misses nuanced non-testability. A model-based grader would be more accurate. |
 | Token cost tracking | No token spend recorded per agent or phase — spikes in context loading are invisible. |
 | Agent calibration run | No way to verify the full pipeline is correctly configured on a new project without running a real phase. |
 | Codebase health pre-flight | No pre-phase assessment of codebase patterns that cause agent failures (inconsistent naming, missing types, unresolved TODOs). |
@@ -340,16 +345,16 @@ Treat agent system prompts like code: version them, review changes, test the eff
 ### Improvement roadmap
 
 **Shipped:**
-- v1.1 — Prompt injection defence, validator completeness, stale agent descriptions, Life OS content removed from templates
+- v1.1 — Prompt injection defence, validator completeness, stale agent descriptions
 - v1.2 — `files_in_scope` enforcement, tiered Architect context (PRD), `context.md` growth cap
 - v1.3 — Mutation testing, acceptance criteria quality gate, security finding category tracking
 - v1.4 — CLAUDE.md, smoke test template, approval fatigue mitigation (revision format, security tasks first)
+- v2.0 — Anchored PASS detection · Validator fix loop · False-GREEN guard · Security context injection · Repo file tree for Architect · Strict manifest schema · `ARCHITECT_ONLY`/`SKIP_ARCHITECT` CI flags · Five GitHub Actions workflow templates · Biome cognitive complexity gate (threshold 10) with per-function score injection into AG-06 · `jscpd` duplication + Vitest coverage tracking · PM agent (AG-PM) with conversational PRD drafting via GitHub Issues
 
 **Planned:**
-- **v2.1** — Architecture doc tiered loading · JSON schema validation for task-manifest.json · pass@1 rate metric
-- **v2.2** — Trajectory evaluation · LLM judge for acceptance criteria · Agent calibration script (`check-pipeline.sh`)
-- **v2.3** — Code health monitoring: `jscpd` duplication gate, Vitest coverage tracking, complexity measurement per task; cross-phase health trends in metrics
-- **v2.4** — Codebase health pre-flight agent (AG-00) · Trust boundary hardening · Token cost tracking
+- **v2.1** — Architecture doc tiered loading · pass@1 rate metric · Agent calibration script (`check-pipeline.sh`)
+- **v2.2** — Trajectory evaluation · LLM judge for acceptance criteria · Token cost tracking
+- **v2.3** — Codebase health pre-flight agent (AG-00) · Trust boundary hardening · Context compaction via LLM summarisation
 - **v3.0** — Parallel task execution for independent tasks in the same phase (dependency-aware wave execution)
 
 ---
