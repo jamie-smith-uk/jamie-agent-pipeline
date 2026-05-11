@@ -56,7 +56,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install opencode
-        run: npm install -g opencode-ai
+        run: npm install -g opencode-ai@1.14.48
 
       - name: Make scripts executable
         run: chmod +x orchestrator/*.sh
@@ -82,6 +82,24 @@ jobs:
           POSTGRES_HOST: localhost
           POSTGRES_PORT: "5432"
           DATABASE_URL: postgresql://lifeos:${{ secrets.POSTGRES_PASSWORD }}@localhost:5432/lifeos
+
+      - name: Dump debug info on failure
+        if: failure()
+        run: |
+          echo "════════════════════════════════════════"
+          echo "  HALT.md"
+          echo "════════════════════════════════════════"
+          cat HALT.md 2>/dev/null || echo "(no HALT.md)"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  Gate failures (last attempt)"
+          echo "════════════════════════════════════════"
+          find pipeline/ -name "gate-failures-*.txt" | sort | tail -1 | xargs cat 2>/dev/null || echo "(no gate failures file)"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  dev-output.md (last agent output)"
+          echo "════════════════════════════════════════"
+          find pipeline/ -name "dev-output.md" | sort | tail -1 | xargs cat 2>/dev/null || echo "(no dev output)"
 
       - name: Commit and push results
         if: success()

@@ -37,6 +37,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node 20
         uses: actions/setup-node@v4
@@ -53,7 +55,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install opencode
-        run: npm install -g opencode-ai
+        run: npm install -g opencode-ai@1.14.48
 
       - name: Make scripts executable
         run: chmod +x orchestrator/*.sh

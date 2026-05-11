@@ -117,7 +117,15 @@ wait_for_approval() {
   while [ $(date +%s) -lt $deadline ]; do
     if [ -f "$approval_file" ]; then
       local signal
-      signal=$(python3 -c "import json; print(json.load(open('$approval_file'))['signal'])")
+      # Pass path as argv[1] — never interpolate filesystem paths into Python source code
+      signal=$(python3 - "$approval_file" <<'PYEOF'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1]))['signal'])
+except Exception as e:
+    print(f"error:{e}", end="")
+PYEOF
+)
       log "Approval received: $signal" >&2
       echo "$signal"
       return 0
@@ -396,6 +404,9 @@ PYEOF
 run_code_health_checks() {
   local task_id="$1" task_dir="$2" files_in_scope_json="$3"
   local label="${4:-}"
+  # skip_tests=1: reuse existing coverage-summary.json instead of re-running the suite.
+  # verify_implementation already ran tests; no need to pay the cost twice (P-02 fix).
+  local skip_tests="${5:-0}"
   local report_file
   if [ "$label" = "pre-refactor" ]; then
     report_file="$task_dir/health-report-pre.json"
@@ -404,12 +415,13 @@ run_code_health_checks() {
   fi
 
   python3 - "$REPO_ROOT" "$PIPELINE_DIR/metrics.json" \
-    "$task_id" "$files_in_scope_json" "$report_file" "$label" <<'PYEOF'
+    "$task_id" "$files_in_scope_json" "$report_file" "$label" "$skip_tests" <<'PYEOF'
 import json, os, re, subprocess, sys
 
 repo_root, metrics_file = sys.argv[1], sys.argv[2]
 task_id, files_json, report_file = sys.argv[3], sys.argv[4], sys.argv[5]
 label = sys.argv[6] if len(sys.argv) > 6 else ''
+skip_tests = sys.argv[7] == '1' if len(sys.argv) > 7 else False
 
 files = [f for f in json.loads(files_json)
          if os.path.isfile(os.path.join(repo_root, f))]
@@ -469,7 +481,7 @@ duplication_pct = None
 if ts_files:
     try:
         r = subprocess.run(
-            ['npx', '--yes', 'jscpd', '--min-lines', '5', '--reporters', 'json',
+            ['npx', '--yes', 'jscpd@3.5.10', '--min-lines', '5', '--reporters', 'json',
              '--output', '/tmp/jscpd-out', *ts_files],
             capture_output=True, text=True, cwd=repo_root, timeout=30
         )
@@ -482,14 +494,17 @@ if ts_files:
         pass
 report['duplication_pct'] = duplication_pct
 
-# ── Coverage: run vitest --coverage if available ─────────────────────────────
+# ── Coverage: read existing summary or run vitest --coverage ─────────────────
+# If skip_tests=True, reuse the coverage-summary.json from the verify_implementation
+# run that already passed — avoids running the full test suite a second time (P-02).
 coverage_pct = None
+summary_file = os.path.join(repo_root, 'coverage', 'coverage-summary.json')
 try:
-    r = subprocess.run(
-        ['pnpm', 'test', '--run', '--coverage', '--coverage.reporter=json-summary'],
-        capture_output=True, text=True, cwd=repo_root, timeout=120
-    )
-    summary_file = os.path.join(repo_root, 'coverage', 'coverage-summary.json')
+    if not skip_tests:
+        subprocess.run(
+            ['pnpm', 'test', '--run', '--coverage', '--coverage.reporter=json-summary'],
+            capture_output=True, text=True, cwd=repo_root, timeout=120
+        )
     if os.path.exists(summary_file):
         s = json.load(open(summary_file))
         total = s.get('total', {})
@@ -636,7 +651,10 @@ revert_scope_violations() {
   while IFS= read -r vf; do
     [[ -z "$vf" ]] && continue
     if git -C "$REPO_ROOT" ls-files --error-unmatch "$vf" 2>/dev/null; then
-      git -C "$REPO_ROOT" checkout HEAD -- "$vf"
+      if ! git -C "$REPO_ROOT" checkout HEAD -- "$vf" 2>/dev/null; then
+        log "  WARNING: could not revert $vf via git checkout (index locked?) — using rm fallback"
+        rm -f "$REPO_ROOT/$vf"
+      fi
     else
       rm -f "$REPO_ROOT/$vf"
     fi
@@ -846,7 +864,7 @@ except json.JSONDecodeError as e:
     print(f"Invalid JSON: {e}")
     sys.exit(0)
 
-tasks = data if isinstance(data, list) else data.get('tasks', [])
+tasks = data if isinstance(data, list) else data.get('tasks', data.get('task_order', []))
 tasks = [t for t in tasks if isinstance(t, dict)]
 
 if not tasks:
@@ -914,13 +932,13 @@ for t in tasks:
 "
 
 # ── Acceptance criteria quality gate (LLM judge with regex fallback) ─────────
-AC_ISSUES=$(python3 - "$PIPELINE_DIR/task-manifest.json" "${ANTHROPIC_API_KEY:-}" <<'PYEOF'
-import json, re, sys, urllib.request
+AC_ISSUES=$(python3 - "$PIPELINE_DIR/task-manifest.json" <<'PYEOF'
+import json, os, re, sys, urllib.request
 
 data = json.load(open(sys.argv[1]))
 tasks = data if isinstance(data, list) else data.get('tasks', [])
 tasks = [t for t in tasks if isinstance(t, dict)]
-api_key = sys.argv[2]
+api_key = os.environ.get('ANTHROPIC_API_KEY', '')
 
 # ── Regex pass: structural issues caught regardless of LLM ───────────────────
 vague = re.compile(
@@ -1033,7 +1051,7 @@ REVISION=0
 
 while [[ "$APPROVAL" == changes:* ]]; do
   REVISION=$(( REVISION + 1 ))
-  if [ "$REVISION" -gt "$MAX_REVISIONS" ]; then
+  if [ "$REVISION" -ge "$MAX_REVISIONS" ]; then
     halt "Manifest revised $MAX_REVISIONS times without approval" "human-gate" "Too many revision rounds — stopping pipeline"
   fi
 
@@ -1113,29 +1131,24 @@ for TASK_ID in $TASKS; do
     continue
   fi
 
-  TASK_JSON=$(python3 -c "
-import json
-data = json.load(open('$PIPELINE_DIR/task-manifest.json'))
-tasks = data if isinstance(data, list) else data.get('tasks', [])
-task = next(t for t in tasks if isinstance(t, dict) and t['id'] == '$TASK_ID')
-print(json.dumps(task, indent=2))
-")
-
-  TASK_TITLE=$(python3 -c "
-import json
-data = json.load(open('$PIPELINE_DIR/task-manifest.json'))
-tasks = data if isinstance(data, list) else data.get('tasks', [])
-task = next(t for t in tasks if isinstance(t, dict) and t['id'] == '$TASK_ID')
-print(task['title'])
-")
-
-  FILES_IN_SCOPE_JSON=$(python3 -c "
-import json
-data = json.load(open('$PIPELINE_DIR/task-manifest.json'))
-tasks = data if isinstance(data, list) else data.get('tasks', [])
-task = next(t for t in tasks if isinstance(t, dict) and t['id'] == '$TASK_ID')
-print(json.dumps(task.get('files_in_scope', [])))
-")
+  # Parse manifest once and extract all task fields in a single Python invocation.
+  # Avoids 4 separate subprocess + file parse calls per task (P-01 fix).
+  eval "$(python3 - "$PIPELINE_DIR/task-manifest.json" "$TASK_ID" <<'PYEOF'
+import json, sys, shlex
+data = json.load(open(sys.argv[1]))
+tasks = data if isinstance(data, list) else data.get('tasks', data.get('task_order', []))
+task = next(t for t in tasks if isinstance(t, dict) and t['id'] == sys.argv[2])
+print(f"TASK_JSON={shlex.quote(json.dumps(task, indent=2))}")
+print(f"TASK_TITLE={shlex.quote(task.get('title', task['id']))}")
+print(f"FILES_IN_SCOPE_JSON={shlex.quote(json.dumps(task.get('files_in_scope', [])))}")
+print(f"SECURITY_SENSITIVE={'true' if task.get('security_sensitive') else 'false'}")
+files = task.get('files_in_scope', [])
+has_mig = any('migration' in f.lower() or f.startswith('migrations/') for f in files)
+print(f"HAS_MIGRATION={'true' if has_mig else 'false'}")
+ac = task.get('acceptance_criteria', [])
+print(f"AC_COUNT={len(ac)}")
+PYEOF
+)"
 
   log ""
   log "========================================"
@@ -1150,21 +1163,8 @@ $TASK_JSON
   # Build context snapshot for this task's agents (empty on first task)
   CONTEXT_BLOCK=$(build_context_block)
 
-  # Detect whether this task includes migration files
-  HAS_MIGRATION=$(python3 -c "
-import json, sys
-files = json.loads(sys.argv[1])
-print('true' if any('migration' in f.lower() or f.startswith('migrations/') for f in files) else 'false')
-" "$FILES_IN_SCOPE_JSON")
-
-  # Detect whether this task is security-sensitive (triggers mutation testing)
-  SECURITY_SENSITIVE=$(python3 -c "
-import json
-data = json.load(open('$PIPELINE_DIR/task-manifest.json'))
-tasks = data if isinstance(data, list) else data.get('tasks', [])
-task = next(t for t in tasks if isinstance(t, dict) and t['id'] == '$TASK_ID')
-print('true' if task.get('security_sensitive') else 'false')
-")
+  # HAS_MIGRATION, SECURITY_SENSITIVE, TASK_JSON, TASK_TITLE, FILES_IN_SCOPE_JSON,
+  # and AC_COUNT are all set by the single-parse eval block above.
 
   # ── RED phase: Tester writes failing tests ────────────────────────────────
   TESTS_WRITTEN_FILE="$TASK_DIR/tests-written.txt"
@@ -1207,14 +1207,7 @@ Follow your system prompt exactly."
     else
       log "RED confirmed — tests fail as expected"
     fi
-    # Trajectory check: verify test files have real assertions
-    AC_COUNT=$(python3 -c "
-import json
-data = json.load(open('$PIPELINE_DIR/task-manifest.json'))
-tasks = data if isinstance(data, list) else data.get('tasks', [])
-task = next(t for t in tasks if isinstance(t, dict) and t['id'] == '$TASK_ID')
-print(len(task.get('acceptance_criteria', [])))
-")
+    # Trajectory check: verify test files have real assertions (AC_COUNT set above)
     check_tester_trajectory "$TASK_DIR" "$TESTS_WRITTEN_FILE" "$AC_COUNT"
     record_task_metrics "$TASK_ID" "$TASK_TITLE" "red" $(( $(date +%s) - RED_START )) 1 "pass"
   else
@@ -1328,7 +1321,7 @@ $(cat "$TASK_DIR/test-red-output.txt" 2>/dev/null | head -20 || true)
 REPORT
         record_task_metrics "$TASK_ID" "$TASK_TITLE" "green" $(( $(date +%s) - GREEN_START )) "$DEV_ATTEMPTS" "pass"
         log "Code health (pre-refactor baseline):"
-        run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON" "pre-refactor"
+        run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON" "pre-refactor" "1"
         log "GREEN phase: PASS"
       else
         log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/3)"
@@ -1462,7 +1455,7 @@ $REFACTOR_FAILURES"
 
     # Post-refactor health check + delta vs baseline
     log "Code health (post-refactor):"
-    run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON"
+    run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON" "" "1"
 
     if [ -f "$TASK_DIR/health-report-pre.json" ] && [ -f "$TASK_DIR/health-report.json" ]; then
       python3 - "$TASK_DIR/health-report-pre.json" "$TASK_DIR/health-report.json" \
@@ -1523,12 +1516,16 @@ PYEOF
   fi
 
   # ── Security phase ────────────────────────────────────────────────────────
+  # Persist attempt count to a file so the 3-attempt limit survives pipeline
+  # resumes — without this, each resume gives a fresh 3 attempts (L-02 fix).
+  SEC_ATTEMPTS_FILE="$TASK_DIR/security-attempts.txt"
   SECURITY_PASSED=false
-  SECURITY_ATTEMPTS=0
+  SECURITY_ATTEMPTS=$(cat "$SEC_ATTEMPTS_FILE" 2>/dev/null || echo "0")
   SECURITY_START=$(date +%s)
 
   while [ "$SECURITY_PASSED" = false ] && [ "$SECURITY_ATTEMPTS" -lt 3 ]; do
     SECURITY_ATTEMPTS=$(( SECURITY_ATTEMPTS + 1 ))
+    echo "$SECURITY_ATTEMPTS" > "$SEC_ATTEMPTS_FILE"
     log "Security attempt $SECURITY_ATTEMPTS/3..."
 
     SEC_PROMPT="You are AG-07 Security Agent for {PROJECT_NAME}.
@@ -1842,8 +1839,19 @@ $PHASE_GATE_FAILURES"
     fi
     log "Post-validation-fix hard gate: PASS — retrying validator..."
 
-    # Scope-compliance check after the fix (informational revert, not a halt)
-    SCOPE_VIOLATIONS=$(check_scope_compliance "[]") || true
+    # Scope-compliance check after the fix — build the union of all tasks' files_in_scope
+    # so that any file touched by the developer fix is permitted if it belongs to any task.
+    ALL_TASKS_FILES_JSON=$(python3 -c "
+import json
+data = json.load(open('$PIPELINE_DIR/task-manifest.json'))
+tasks = data if isinstance(data, list) else data.get('tasks', data.get('task_order', []))
+files = []
+for t in tasks:
+    if isinstance(t, dict):
+        files.extend(t.get('files_in_scope', []))
+print(json.dumps(list(dict.fromkeys(files))))
+" 2>/dev/null || echo "[]")
+    SCOPE_VIOLATIONS=$(check_scope_compliance "$ALL_TASKS_FILES_JSON") || true
     if [ -n "$SCOPE_VIOLATIONS" ]; then
       log "Reverting out-of-scope changes from validation fix..."
       revert_scope_violations <<< "$SCOPE_VIOLATIONS"

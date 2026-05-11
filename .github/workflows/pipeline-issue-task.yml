@@ -66,7 +66,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install opencode
-        run: npm install -g opencode-ai
+        run: npm install -g opencode-ai@1.14.48
 
       - name: Make scripts executable
         run: chmod +x orchestrator/*.sh
@@ -86,18 +86,21 @@ jobs:
       - name: Build task description
         id: description
         run: |
-          # Combine title and body into a single description for run-task.sh
+          # Combine title and body — both are env vars, never ${{ }} in shell (S-06 fix)
           DESCRIPTION="${ISSUE_TITLE}"
-          if [ -n "$ISSUE_BODY" ]; then
+          if [ -n "${ISSUE_BODY:-}" ]; then
             DESCRIPTION="${ISSUE_TITLE}. ${ISSUE_BODY}"
           fi
           # Trim to 500 chars so it doesn't overflow the shell arg
-          DESCRIPTION=$(echo "$DESCRIPTION" | cut -c1-500)
-          echo "text=$DESCRIPTION" >> $GITHUB_OUTPUT
+          DESCRIPTION=$(printf '%s' "$DESCRIPTION" | cut -c1-500)
+          # Write to a file rather than GITHUB_OUTPUT to avoid shell metachar injection
+          printf '%s' "$DESCRIPTION" > /tmp/task-description.txt
+          echo "text=$(cat /tmp/task-description.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Run task
-        run: ./orchestrator/run-task.sh --phase 0 --quick "${{ steps.description.outputs.text }}"
+        run: ./orchestrator/run-task.sh --quick "$TASK_DESCRIPTION"
         env:
+          TASK_DESCRIPTION: ${{ steps.description.outputs.text }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TODOIST_API_TOKEN: ${{ secrets.TODOIST_API_TOKEN }}
           POSTGRES_USER: lifeos

@@ -41,17 +41,9 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-          run_install: false
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
       - name: Install opencode
-        run: npm install -g opencode-ai
+        # PM agent only writes markdown — no project deps needed (C-03 fix)
+        run: npm install -g opencode-ai@1.14.48
 
       - name: Determine round number
         id: round
@@ -96,7 +88,7 @@ jobs:
           EXISTING_ARCH=$(cat /tmp/existing-arch.txt)
           PREVIOUS_DRAFTS=$(cat /tmp/previous-drafts.txt)
 
-          cat > /tmp/pm-prompt.txt << PROMPT
+          cat > /tmp/pm-prompt.txt << 'PROMPT'
           You are running as AG-PM Product Manager.
 
           Issue number: ${ISSUE_NUMBER}
@@ -172,47 +164,43 @@ jobs:
             | grep -v "^## " | head -5 | sed '/^$/d')
           PHASES=$(grep "^## Phase" "$DRAFT" | sed 's/^## /- /')
 
-          # Write summary to file to avoid shell quoting issues
-          {
-            echo "WHAT_CHANGED<<EOF"
-            echo "${WHAT_CHANGED:-Initial draft.}"
-            echo "EOF"
-            echo "BRIEF<<EOF"
-            echo "${BRIEF}"
-            echo "EOF"
-            echo "PHASES<<EOF"
-            echo "${PHASES:-None listed}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          # Write summary sections to temp files — the Post comment step reads
+          # these directly to avoid ${{ }} expression injection (C-07 fix).
+          printf '%s' "${WHAT_CHANGED:-Initial draft.}" > /tmp/summary-what-changed.txt
+          printf '%s' "${BRIEF}" > /tmp/summary-brief.txt
+          printf '%s' "${PHASES:-None listed}" > /tmp/summary-phases.txt
 
       - name: Post comment on issue
+        # Read summary values from files written by the Extract step rather than
+        # interpolating ${{ steps.summary.outputs.* }} directly into the run: block.
+        # ${{ }} expressions are substituted before shell parsing, so agent output
+        # containing backticks or $() would execute as shell commands (C-07 fix).
+        env:
+          ROUND: ${{ steps.round.outputs.round }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
         run: |
-          ROUND="${{ steps.round.outputs.round }}"
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           DRAFT_PATH="docs/prd-drafts/issue-${ISSUE_NUMBER}-round-${ROUND}.md"
-          WHAT_CHANGED="${{ steps.summary.outputs.WHAT_CHANGED }}"
-          BRIEF="${{ steps.summary.outputs.BRIEF }}"
-          PHASES="${{ steps.summary.outputs.PHASES }}"
+          WHAT_CHANGED=$(cat /tmp/summary-what-changed.txt 2>/dev/null || echo "Initial draft.")
+          BRIEF=$(cat /tmp/summary-brief.txt 2>/dev/null || echo "")
+          PHASES=$(cat /tmp/summary-phases.txt 2>/dev/null || echo "None listed")
 
-          cat > /tmp/comment.txt << COMMENT
-          ## PM Agent — Round ${ROUND} draft ready
+          cat > /tmp/comment.txt << 'COMMENT_EOF'
+          ## PM Agent — Round ROUND_PLACEHOLDER draft ready
+          COMMENT_EOF
 
-          **What changed**
-          ${WHAT_CHANGED}
-
-          **Summary**
-          ${BRIEF}
-
-          **Phases drafted**
-          ${PHASES}
-
-          **Full draft:** [\`${DRAFT_PATH}\`](https://github.com/${{ github.repository }}/blob/main/${DRAFT_PATH})
-          **Actions run:** ${RUN_URL}
-
-          ---
-          To request changes: reply with your feedback, then re-add the \`pm-ready\` label.
-          To approve and append to \`docs/prd.md\`: add the \`pm-approve\` label.
-          COMMENT
+          # Build comment body safely using printf to avoid heredoc injection
+          {
+            printf '## PM Agent — Round %s draft ready\n\n' "$ROUND"
+            printf '**What changed**\n%s\n\n' "$WHAT_CHANGED"
+            printf '**Summary**\n%s\n\n' "$BRIEF"
+            printf '**Phases drafted**\n%s\n\n' "$PHASES"
+            printf '**Full draft:** [`%s`](https://github.com/%s/blob/main/%s)\n' \
+              "$DRAFT_PATH" "$REPO" "$DRAFT_PATH"
+            printf '**Actions run:** %s\n\n' "$RUN_URL"
+            printf '---\nTo request changes: reply with your feedback, then re-add the `pm-ready` label.\n'
+            printf 'To approve and append to `docs/prd.md`: add the `pm-approve` label.\n'
+          } > /tmp/comment.txt
 
           gh issue comment "$ISSUE_NUMBER" --body "$(cat /tmp/comment.txt)"
 

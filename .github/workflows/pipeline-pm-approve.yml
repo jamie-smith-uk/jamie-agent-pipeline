@@ -86,45 +86,9 @@ jobs:
           mkdir -p docs
           touch docs/prd.md
 
-          # Extract only the phase and user story sections from the draft
-          # (skip the draft header, "What changed", "Brief summary", "Architectural
-          # implications", "Sequencing notes", and "Open questions" sections —
-          # those are for the human reviewer, not the PRD itself)
-          cat > /tmp/extract-prd.py << 'PYEOF'
-          import re, sys
-
-          content = open(sys.argv[1]).read()
-
-          # Extract sections that belong in the PRD:
-          # - "## Phase N — ..." blocks (includes exit criteria, smoke tests, epics)
-          # - "## User stories" and all "### EP-" blocks beneath it
-          kept = []
-
-          # Find Phase sections
-          phase_blocks = re.findall(
-              r'(^## Phase \d+.*?)(?=^## (?!Phase \d+.*?###)|^## User stories|\Z)',
-              content, re.MULTILINE | re.DOTALL
-          )
-          for block in phase_blocks:
-              kept.append(block.strip())
-
-          # Find User stories section
-          stories_match = re.search(
-              r'(^## User stories.*?)(?=^## (?!EP-)|\Z)',
-              content, re.MULTILINE | re.DOTALL
-          )
-          if stories_match:
-              kept.append(stories_match.group(1).strip())
-
-          if not kept:
-              print("WARNING: No phase or user story sections found to extract", file=__import__('sys').stderr)
-              sys.exit(1)
-
-          # Add a separator before appending
-          print("\n\n---\n")
-          print("\n\n---\n\n".join(kept))
-          PYEOF
-          python3 /tmp/extract-prd.py "$DRAFT" >> docs/prd.md
+          # Use the checked-in extraction script — avoids inline Python at column 0
+          # which breaks YAML parsing (C-06 fix).
+          python3 orchestrator/extract-prd-sections.py "$DRAFT" >> docs/prd.md
 
           echo "Appended draft phases to docs/prd.md"
 
@@ -141,14 +105,8 @@ jobs:
           DRAFT="${{ steps.draft.outputs.latest }}"
           ROUND="${{ steps.draft.outputs.round }}"
 
-          # Extract architectural implications for the PR body
-          cat > /tmp/extract-arch.py << 'PYEOF'
-          import re, sys
-          content = open(sys.argv[1]).read()
-          m = re.search(r'## Architectural implications\n(.*?)(?=\n## |\Z)', content, re.DOTALL)
-          print(m.group(1).strip() if m else "See draft for details.")
-          PYEOF
-          ARCH_IMPLICATIONS=$(python3 /tmp/extract-arch.py "$DRAFT")
+          # Extract architectural implications for the PR body using checked-in script
+          ARCH_IMPLICATIONS=$(python3 orchestrator/extract-arch-implications.py "$DRAFT")
 
           cat > /tmp/pr-body.txt << PRBODY
           ## Summary
