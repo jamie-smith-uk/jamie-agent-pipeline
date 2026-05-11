@@ -1,0 +1,207 @@
+name: PM — Approve PRD
+run-name: "PM Approve — #${{ github.event.issue.number }} ${{ github.event.issue.title }}"
+
+# Triggered when an issue is labeled "pm-approve".
+# Takes the latest draft round for this issue, appends it to docs/prd.md,
+# opens a pull request, and closes the issue with a link to the PR.
+#
+# Prerequisites:
+#   - At least one draft must exist in docs/prd-drafts/issue-{N}-round-*.md
+#   - The draft must contain at least one "## Phase" section
+#
+# After this workflow:
+#   - Review the PR diff carefully
+#   - Update docs/architecture.md manually with any new tables/APIs flagged
+#     in the "Architectural implications" section of the draft
+#   - Merge the PR when ready
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  pm-approve:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'pm-approve'
+
+    permissions:
+      issues: write
+      contents: write
+      pull-requests: write
+
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find latest draft
+        id: draft
+        run: |
+          LATEST=$(ls docs/prd-drafts/issue-${ISSUE_NUMBER}-round-*.md 2>/dev/null \
+            | sort -t- -k4 -n | tail -1)
+
+          if [ -z "$LATEST" ]; then
+            echo "ERROR: No draft found for issue #${ISSUE_NUMBER}"
+            echo "Run the PM Draft workflow first by adding the pm-ready label."
+            exit 1
+          fi
+
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest draft: $LATEST"
+
+          # Extract the round number
+          ROUND=$(echo "$LATEST" | grep -oE 'round-[0-9]+' | grep -oE '[0-9]+')
+          echo "round=$ROUND" >> "$GITHUB_OUTPUT"
+
+      - name: Validate draft contains phases
+        run: |
+          DRAFT="${{ steps.draft.outputs.latest }}"
+          PHASE_COUNT=$(grep -c "^## Phase" "$DRAFT" || true)
+          if [ "$PHASE_COUNT" -eq 0 ]; then
+            echo "ERROR: Draft contains no '## Phase' sections — cannot append to prd.md"
+            exit 1
+          fi
+          echo "Found $PHASE_COUNT phase(s) in draft"
+
+      - name: Create branch
+        id: branch
+        run: |
+          BRANCH="pm/issue-${ISSUE_NUMBER}-prd-update"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Append draft to prd.md
+        run: |
+          DRAFT="${{ steps.draft.outputs.latest }}"
+
+          # Ensure docs/ exists and prd.md exists
+          mkdir -p docs
+          touch docs/prd.md
+
+          # Extract only the phase and user story sections from the draft
+          # (skip the draft header, "What changed", "Brief summary", "Architectural
+          # implications", "Sequencing notes", and "Open questions" sections —
+          # those are for the human reviewer, not the PRD itself)
+          cat > /tmp/extract-prd.py << 'PYEOF'
+          import re, sys
+
+          content = open(sys.argv[1]).read()
+
+          # Extract sections that belong in the PRD:
+          # - "## Phase N — ..." blocks (includes exit criteria, smoke tests, epics)
+          # - "## User stories" and all "### EP-" blocks beneath it
+          kept = []
+
+          # Find Phase sections
+          phase_blocks = re.findall(
+              r'(^## Phase \d+.*?)(?=^## (?!Phase \d+.*?###)|^## User stories|\Z)',
+              content, re.MULTILINE | re.DOTALL
+          )
+          for block in phase_blocks:
+              kept.append(block.strip())
+
+          # Find User stories section
+          stories_match = re.search(
+              r'(^## User stories.*?)(?=^## (?!EP-)|\Z)',
+              content, re.MULTILINE | re.DOTALL
+          )
+          if stories_match:
+              kept.append(stories_match.group(1).strip())
+
+          if not kept:
+              print("WARNING: No phase or user story sections found to extract", file=__import__('sys').stderr)
+              sys.exit(1)
+
+          # Add a separator before appending
+          print("\n\n---\n")
+          print("\n\n---\n\n".join(kept))
+          PYEOF
+          python3 /tmp/extract-prd.py "$DRAFT" >> docs/prd.md
+
+          echo "Appended draft phases to docs/prd.md"
+
+      - name: Commit and push
+        run: |
+          ROUND="${{ steps.draft.outputs.round }}"
+          git add docs/prd.md
+          git commit -m "docs(prd): append phases from issue #${ISSUE_NUMBER} round ${ROUND} — ${ISSUE_TITLE}"
+          git push origin "${{ steps.branch.outputs.branch }}"
+
+      - name: Open pull request
+        id: pr
+        run: |
+          DRAFT="${{ steps.draft.outputs.latest }}"
+          ROUND="${{ steps.draft.outputs.round }}"
+
+          # Extract architectural implications for the PR body
+          cat > /tmp/extract-arch.py << 'PYEOF'
+          import re, sys
+          content = open(sys.argv[1]).read()
+          m = re.search(r'## Architectural implications\n(.*?)(?=\n## |\Z)', content, re.DOTALL)
+          print(m.group(1).strip() if m else "See draft for details.")
+          PYEOF
+          ARCH_IMPLICATIONS=$(python3 /tmp/extract-arch.py "$DRAFT")
+
+          cat > /tmp/pr-body.txt << PRBODY
+          ## Summary
+
+          Appends phases drafted in issue #${ISSUE_NUMBER} (round ${ROUND}) to \`docs/prd.md\`.
+
+          ## Architectural implications
+
+          ${ARCH_IMPLICATIONS}
+
+          **Action required:** Review the architectural implications above and update \`docs/architecture.md\` manually before merging if new tables, APIs, or services are introduced.
+
+          ## Source
+          - Issue: #${ISSUE_NUMBER}
+          - Draft: \`${DRAFT}\`
+          - Closes #${ISSUE_NUMBER}
+          PRBODY
+
+          PR_URL=$(gh pr create \
+            --title "docs(prd): ${ISSUE_TITLE}" \
+            --body "$(cat /tmp/pr-body.txt)" \
+            --base main \
+            --head "${{ steps.branch.outputs.branch }}")
+
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "PR created: $PR_URL"
+
+      - name: Comment on issue with PR link
+        run: |
+          PR_URL="${{ steps.pr.outputs.pr_url }}"
+          DRAFT="${{ steps.draft.outputs.latest }}"
+
+          cat > /tmp/approve-comment.txt << APPCOMMENT
+          ## PM Agent — Approved
+
+          The latest draft has been appended to \`docs/prd.md\` and a pull request has been opened:
+
+          **PR:** $PR_URL
+
+          **Before merging the PR:**
+          - Review the diff in \`docs/prd.md\`
+          - Check the "Architectural implications" section in the draft (\`${DRAFT}\`) and update \`docs/architecture.md\` if new tables, APIs, env vars, or services are introduced
+
+          The implementation pipeline can be run against the new phases once the PR is merged.
+          APPCOMMENT
+
+          gh issue comment "$ISSUE_NUMBER" --body "$(cat /tmp/approve-comment.txt)"
+
+      - name: Close issue
+        run: |
+          gh issue close "$ISSUE_NUMBER" --reason completed
+
+      - name: Remove pm-approve label
+        if: always()
+        run: |
+          gh issue edit "$ISSUE_NUMBER" --remove-label "pm-approve" || true

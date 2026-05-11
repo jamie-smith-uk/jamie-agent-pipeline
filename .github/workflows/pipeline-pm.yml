@@ -1,0 +1,223 @@
+name: PM — Draft PRD
+run-name: "PM Draft — #${{ github.event.issue.number }} ${{ github.event.issue.title }}"
+
+# Triggered when an issue is labeled "pm-ready".
+# Runs the PM agent to produce or revise a PRD draft, then posts a summary
+# comment on the issue with the round number and what changed.
+#
+# Conversational loop:
+#   1. Create a GitHub Issue describing the feature
+#   2. Add label "pm-ready" → this workflow runs (Round 1)
+#   3. Review the draft in the artifact or in the issue comment
+#   4. Reply to the issue with feedback, then re-add "pm-ready" → Round 2
+#   5. Repeat until satisfied, then add label "pm-approve"
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  pm-draft:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'pm-ready'
+
+    permissions:
+      issues: write
+      contents: write
+
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install opencode
+        run: npm install -g opencode-ai
+
+      - name: Determine round number
+        id: round
+        run: |
+          # Count existing draft files for this issue to determine round
+          DRAFTS=$(ls docs/prd-drafts/issue-${ISSUE_NUMBER}-round-*.md 2>/dev/null | wc -l | tr -d ' ')
+          ROUND=$(( DRAFTS + 1 ))
+          echo "round=$ROUND" >> "$GITHUB_OUTPUT"
+          echo "Round: $ROUND"
+
+      - name: Gather inputs
+        id: inputs
+        run: |
+          mkdir -p docs/prd-drafts
+
+          # Issue body
+          gh issue view "$ISSUE_NUMBER" --json body --jq '.body' > /tmp/issue-body.txt
+
+          # All comments (feedback from previous rounds)
+          gh issue view "$ISSUE_NUMBER" --json comments \
+            --jq '.comments | map("@" + .author.login + ": " + .body) | join("\n---\n")' \
+            > /tmp/issue-comments.txt
+
+          # Existing PRD (may not exist)
+          cat docs/prd.md 2>/dev/null > /tmp/existing-prd.txt || echo "" > /tmp/existing-prd.txt
+
+          # Existing architecture (may not exist)
+          cat docs/architecture.md 2>/dev/null > /tmp/existing-arch.txt || echo "" > /tmp/existing-arch.txt
+
+          # Previous drafts for this issue (may not exist)
+          cat docs/prd-drafts/issue-${ISSUE_NUMBER}-round-*.md 2>/dev/null \
+            > /tmp/previous-drafts.txt || echo "" > /tmp/previous-drafts.txt
+
+          echo "Inputs gathered"
+
+      - name: Run PM agent
+        run: |
+          ROUND="${{ steps.round.outputs.round }}"
+          ISSUE_BODY=$(cat /tmp/issue-body.txt)
+          ISSUE_COMMENTS=$(cat /tmp/issue-comments.txt)
+          EXISTING_PRD=$(cat /tmp/existing-prd.txt)
+          EXISTING_ARCH=$(cat /tmp/existing-arch.txt)
+          PREVIOUS_DRAFTS=$(cat /tmp/previous-drafts.txt)
+
+          cat > /tmp/pm-prompt.txt << PROMPT
+          You are running as AG-PM Product Manager.
+
+          Issue number: ${ISSUE_NUMBER}
+          Issue title: ${ISSUE_TITLE}
+          Round: ${ROUND}
+
+          <issue-body>
+          ${ISSUE_BODY}
+          </issue-body>
+
+          <issue-comments>
+          ${ISSUE_COMMENTS:-"(no comments yet)"}
+          </issue-comments>
+
+          <existing-prd>
+          ${EXISTING_PRD:-"(no existing PRD — this is a new product)"}
+          </existing-prd>
+
+          <existing-architecture>
+          ${EXISTING_ARCH:-"(no existing architecture document)"}
+          </existing-architecture>
+
+          <previous-drafts>
+          ${PREVIOUS_DRAFTS:-"(no previous drafts — this is round 1)"}
+          </previous-drafts>
+
+          Write your draft to: docs/prd-drafts/issue-${ISSUE_NUMBER}-round-${ROUND}.md
+
+          Follow your system prompt exactly. Write the file and halt.
+          PROMPT
+          PM_PROMPT=$(cat /tmp/pm-prompt.txt)
+
+          opencode run --agent ag-pm "$PM_PROMPT"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Verify draft was written
+        id: verify
+        run: |
+          ROUND="${{ steps.round.outputs.round }}"
+          DRAFT="docs/prd-drafts/issue-${ISSUE_NUMBER}-round-${ROUND}.md"
+          if [ ! -f "$DRAFT" ]; then
+            echo "ERROR: PM agent did not write $DRAFT"
+            exit 1
+          fi
+          echo "draft_path=$DRAFT" >> "$GITHUB_OUTPUT"
+          echo "Draft written: $DRAFT"
+          wc -l "$DRAFT"
+
+      - name: Commit draft to repo
+        run: |
+          ROUND="${{ steps.round.outputs.round }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/prd-drafts/
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "docs(pm): issue #${ISSUE_NUMBER} round ${ROUND} draft"
+            git push
+          fi
+
+      - name: Extract summary from draft
+        id: summary
+        run: |
+          ROUND="${{ steps.round.outputs.round }}"
+          DRAFT="docs/prd-drafts/issue-${ISSUE_NUMBER}-round-${ROUND}.md"
+
+          # Extract "What changed" and "Brief summary" sections for the comment
+          WHAT_CHANGED=$(awk '/^## What changed/,/^## /' "$DRAFT" \
+            | grep -v "^## " | head -10 | sed '/^$/d')
+          BRIEF=$(awk '/^## Brief summary/,/^## /' "$DRAFT" \
+            | grep -v "^## " | head -5 | sed '/^$/d')
+          PHASES=$(grep "^## Phase" "$DRAFT" | sed 's/^## /- /')
+
+          # Write summary to file to avoid shell quoting issues
+          {
+            echo "WHAT_CHANGED<<EOF"
+            echo "${WHAT_CHANGED:-Initial draft.}"
+            echo "EOF"
+            echo "BRIEF<<EOF"
+            echo "${BRIEF}"
+            echo "EOF"
+            echo "PHASES<<EOF"
+            echo "${PHASES:-None listed}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post comment on issue
+        run: |
+          ROUND="${{ steps.round.outputs.round }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          DRAFT_PATH="docs/prd-drafts/issue-${ISSUE_NUMBER}-round-${ROUND}.md"
+          WHAT_CHANGED="${{ steps.summary.outputs.WHAT_CHANGED }}"
+          BRIEF="${{ steps.summary.outputs.BRIEF }}"
+          PHASES="${{ steps.summary.outputs.PHASES }}"
+
+          cat > /tmp/comment.txt << COMMENT
+          ## PM Agent — Round ${ROUND} draft ready
+
+          **What changed**
+          ${WHAT_CHANGED}
+
+          **Summary**
+          ${BRIEF}
+
+          **Phases drafted**
+          ${PHASES}
+
+          **Full draft:** [\`${DRAFT_PATH}\`](https://github.com/${{ github.repository }}/blob/main/${DRAFT_PATH})
+          **Actions run:** ${RUN_URL}
+
+          ---
+          To request changes: reply with your feedback, then re-add the \`pm-ready\` label.
+          To approve and append to \`docs/prd.md\`: add the \`pm-approve\` label.
+          COMMENT
+
+          gh issue comment "$ISSUE_NUMBER" --body "$(cat /tmp/comment.txt)"
+
+      - name: Remove pm-ready label
+        if: always()
+        run: |
+          # Remove the label so re-adding it triggers a fresh run
+          gh issue edit "$ISSUE_NUMBER" --remove-label "pm-ready" || true

@@ -1,0 +1,124 @@
+name: Pipeline — Architect
+
+# Runs AG-01 + AG-02, commits the pipeline/ output to main, and prints the
+# manifest for review. When this completes successfully, review the manifest in
+# the job logs then trigger "Pipeline — Implement" for the same phase.
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Phase number"
+        required: true
+        default: "1"
+
+jobs:
+  architect:
+    runs-on: ubuntu-latest
+
+    env:
+      PHASE: ${{ github.event.inputs.phase }}
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: lifeos
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: lifeos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install opencode
+        run: npm install -g opencode-ai
+
+      - name: Make scripts executable
+        run: chmod +x orchestrator/*.sh
+
+      - name: Run AG-01 Architect + AG-02 Reviewer
+        run: ARCHITECT_ONLY=1 ./orchestrator/run-phase.sh --phase "$PHASE"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          POSTGRES_USER: lifeos
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: lifeos
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+          DATABASE_URL: postgresql://lifeos:${{ secrets.POSTGRES_PASSWORD }}@localhost:5432/lifeos
+
+      - name: Dump debug info on failure
+        if: failure()
+        run: |
+          echo "════════════════════════════════════════"
+          echo "  HALT.md"
+          echo "════════════════════════════════════════"
+          cat HALT.md 2>/dev/null || echo "(no HALT.md)"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  schema-errors.txt"
+          echo "════════════════════════════════════════"
+          cat "pipeline/phase-${PHASE}/schema-errors.txt" 2>/dev/null || echo "(no schema errors file)"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  task-manifest.json (raw)"
+          echo "════════════════════════════════════════"
+          cat "pipeline/phase-${PHASE}/task-manifest.json" 2>/dev/null || echo "(no manifest)"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  ag01-output.md (agent stdout)"
+          echo "════════════════════════════════════════"
+          cat "pipeline/phase-${PHASE}/ag01-output.md" 2>/dev/null || echo "(no agent output)"
+
+      - name: Print manifest for review
+        if: success()
+        run: |
+          echo "════════════════════════════════════════"
+          echo "  TASK MANIFEST — Phase ${PHASE}"
+          echo "════════════════════════════════════════"
+          cat "pipeline/phase-${PHASE}/task-manifest.json" 2>/dev/null || echo "(no manifest found)"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  REVIEWER SUMMARY — Phase ${PHASE}"
+          echo "════════════════════════════════════════"
+          cat "pipeline/phase-${PHASE}/reviewer-summary.md" 2>/dev/null || echo "(no reviewer summary found)"
+          echo ""
+          echo "────────────────────────────────────────"
+          echo "  Review the above then trigger:"
+          echo "  Actions → Pipeline — Implement → phase ${PHASE}"
+          echo "────────────────────────────────────────"
+
+      - name: Commit pipeline output to repo
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f pipeline/phase-${PHASE}/
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "chore(pipeline): phase ${PHASE} architect output [skip ci]"
+            git push
+          fi

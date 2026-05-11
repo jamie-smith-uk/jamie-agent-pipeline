@@ -1,0 +1,97 @@
+name: Pipeline — Implement
+
+# Executes the full task loop (AG-03 → AG-08) using the pipeline/ output
+# committed to the repo by the Architect run, then commits results back.
+# Only trigger this after reviewing the manifest from the Architect run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Phase number"
+        required: true
+        default: "1"
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    env:
+      PHASE: ${{ github.event.inputs.phase }}
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: lifeos
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: lifeos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install opencode
+        run: npm install -g opencode-ai
+
+      - name: Make scripts executable
+        run: chmod +x orchestrator/*.sh
+
+      - name: Run pending migrations
+        run: |
+          if [ -d migrations ] && ls migrations/*.sql 2>/dev/null | head -1; then
+            pnpm exec node-pg-migrate up
+          else
+            echo "No migrations to run"
+          fi
+        env:
+          DATABASE_URL: postgresql://lifeos:${{ secrets.POSTGRES_PASSWORD }}@localhost:5432/lifeos
+
+      - name: Run implementation (AG-03 → AG-08)
+        run: SKIP_ARCHITECT=1 ./orchestrator/run-phase.sh --phase "$PHASE"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TODOIST_API_TOKEN: ${{ secrets.TODOIST_API_TOKEN }}
+          POSTGRES_USER: lifeos
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: lifeos
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+          DATABASE_URL: postgresql://lifeos:${{ secrets.POSTGRES_PASSWORD }}@localhost:5432/lifeos
+
+      - name: Commit and push results
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "chore(pipeline): phase ${PHASE} implementation [skip ci]"
+            git push
+          fi

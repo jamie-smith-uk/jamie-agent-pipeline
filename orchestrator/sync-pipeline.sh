@@ -78,10 +78,11 @@ echo "  Source:   $PIPELINE_REPO"
 echo "  Target:   $TARGET"
 echo ""
 echo "Will update:"
-echo "  .opencode/agents/*.md    → target/.opencode/agents/"
-echo "  .opencode/config.json    → target/.opencode/config.json"
-echo "  .opencode/rules/*.md     → target/.opencode/rules/"
-echo "  orchestrator/*.sh        → target/orchestrator/ (executable)"
+echo "  .opencode/agents/*.md        → target/.opencode/agents/"
+echo "  .opencode/config.json        → target/.opencode/config.json"
+echo "  .opencode/rules/*.md         → target/.opencode/rules/"
+echo "  orchestrator/*.sh            → target/orchestrator/ (executable)"
+echo "  .github/workflows/*.yml      → target/.github/workflows/"
 echo ""
 echo "Will NOT touch:"
 echo "  docs/         (project-specific)"
@@ -131,6 +132,17 @@ for script in run-phase.sh run-task.sh check-pipeline.sh approve.sh; do
   chmod +x "$TARGET/orchestrator/$script"
   log "  → orchestrator/$script"
 done
+
+# ── Sync GitHub Actions workflows ────────────────────────────────────────────
+if [ -d "$PIPELINE_REPO/.github/workflows" ]; then
+  log "Syncing GitHub Actions workflows..."
+  mkdir -p "$TARGET/.github/workflows"
+  for wf in "$PIPELINE_REPO"/.github/workflows/*.yml; do
+    filename="$(basename "$wf")"
+    substitute "$wf" "$TARGET/.github/workflows/$filename"
+    log "  → .github/workflows/$filename"
+  done
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""

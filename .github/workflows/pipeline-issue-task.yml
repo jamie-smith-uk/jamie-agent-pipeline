@@ -1,0 +1,178 @@
+name: Pipeline — Issue Task
+
+# Picks up a GitHub Issue labelled "pipeline-ready" and runs it as a single
+# task through the full pipeline. On success, closes the issue and comments
+# with the commit SHA. On failure, comments with the error and removes the
+# label so the issue stays open for retry.
+#
+# To use:
+#   1. Create an issue. Title = what to do. Body = context, file paths, constraints.
+#   2. Add the label "pipeline-ready".
+#   3. This workflow triggers automatically.
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  task:
+    # Only run when the label added is exactly "pipeline-ready"
+    if: github.event.label.name == 'pipeline-ready'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    permissions:
+      issues: write   # to comment and close the issue
+      contents: write # to commit and push results
+
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_BODY: ${{ github.event.issue.body }}
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: lifeos
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: lifeos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install opencode
+        run: npm install -g opencode-ai
+
+      - name: Make scripts executable
+        run: chmod +x orchestrator/*.sh
+
+      - name: Comment — pipeline starting
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(process.env.ISSUE_NUMBER),
+              body: `🤖 Pipeline started — [view run](${runUrl})`
+            });
+
+      - name: Build task description
+        id: description
+        run: |
+          # Combine title and body into a single description for run-task.sh
+          DESCRIPTION="${ISSUE_TITLE}"
+          if [ -n "$ISSUE_BODY" ]; then
+            DESCRIPTION="${ISSUE_TITLE}. ${ISSUE_BODY}"
+          fi
+          # Trim to 500 chars so it doesn't overflow the shell arg
+          DESCRIPTION=$(echo "$DESCRIPTION" | cut -c1-500)
+          echo "text=$DESCRIPTION" >> $GITHUB_OUTPUT
+
+      - name: Run task
+        run: ./orchestrator/run-task.sh --phase 0 --quick "${{ steps.description.outputs.text }}"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TODOIST_API_TOKEN: ${{ secrets.TODOIST_API_TOKEN }}
+          POSTGRES_USER: lifeos
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: lifeos
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+          DATABASE_URL: postgresql://lifeos:${{ secrets.POSTGRES_PASSWORD }}@localhost:5432/lifeos
+
+      - name: Commit and push results
+        if: success()
+        id: commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "sha=no-changes" >> $GITHUB_OUTPUT
+          else
+            SHORT=$(echo "$ISSUE_TITLE" | cut -c1-72)
+            git commit -m "fix: ${SHORT} (closes #${ISSUE_NUMBER}) [skip ci]"
+            git push
+            echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Close issue and comment on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = '${{ steps.commit.outputs.sha }}';
+            const body = sha === 'no-changes'
+              ? '✅ Pipeline completed — no file changes were needed.'
+              : `✅ Done — committed as \`${sha}\``;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(process.env.ISSUE_NUMBER),
+              body
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(process.env.ISSUE_NUMBER),
+              state: 'closed'
+            });
+
+      - name: Dump debug info on failure
+        if: failure()
+        run: |
+          echo "════════════════════════════════════════"
+          echo "  HALT.md"
+          echo "════════════════════════════════════════"
+          cat HALT.md 2>/dev/null || echo "(no HALT.md)"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  dev-output.md (last agent output)"
+          echo "════════════════════════════════════════"
+          find pipeline/ -name "dev-output.md" | sort | tail -1 | xargs cat 2>/dev/null || echo "(no dev output)"
+
+      - name: Comment and remove label on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(process.env.ISSUE_NUMBER),
+              body: `❌ Pipeline failed — [view logs](${runUrl})\n\nRemove and re-add the \`pipeline-ready\` label to retry.`
+            });
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(process.env.ISSUE_NUMBER),
+              name: 'pipeline-ready'
+            });

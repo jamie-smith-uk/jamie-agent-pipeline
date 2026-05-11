@@ -40,6 +40,7 @@ log "Creating directory structure..."
 mkdir -p \
   "$TARGET/.opencode/agents" \
   "$TARGET/.opencode/rules" \
+  "$TARGET/.github/workflows" \
   "$TARGET/orchestrator" \
   "$TARGET/docs" \
   "$TARGET/pipeline" \
@@ -78,6 +79,18 @@ done
 
 mkdir -p "$TARGET/backlog"
 cp "$PIPELINE_REPO/backlog/README.md" "$TARGET/backlog/README.md" 2>/dev/null || true
+
+# ── Copy GitHub Actions workflows ────────────────────────────────────────────
+log "Copying GitHub Actions workflows..."
+if [ -d "$PIPELINE_REPO/.github/workflows" ]; then
+  for wf in "$PIPELINE_REPO"/.github/workflows/*.yml; do
+    filename="$(basename "$wf")"
+    substitute "$wf" "$TARGET/.github/workflows/$filename"
+    log "  → .github/workflows/$filename"
+  done
+else
+  log "  ! No .github/workflows/ found in pipeline repo — skipping"
+fi
 
 # ── Copy doc templates ────────────────────────────────────────────────────────
 log "Copying doc templates..."

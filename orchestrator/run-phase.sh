@@ -66,7 +66,9 @@ $detail
 EOF
   printf "\a"  # terminal bell
   log "PIPELINE HALTED: $reason (agent: $agent)"
-  log "See HALT.md for full detail."
+  echo "=== HALT DETAIL ===" >&2
+  echo "$detail" >&2
+  echo "===================" >&2
   exit 1
 }
 
@@ -126,17 +128,30 @@ wait_for_approval() {
   halt "Approval timeout" "human-gate" "No approval signal received within 24 hours"
 }
 
-# Checks that a report file contains a PASS title line as written by the agents.
-# Matches "Title: ... — PASS" or "# ... — PASS" — avoids false positives from
-# body text that happens to contain the word PASS.
+# Checks that a report file contains a PASS verdict in its opening lines.
+# Only inspects the first 10 lines so that references to earlier PASS reports
+# in the body cannot create a false positive.
+# Accepted formats (all must appear in lines 1-10):
+#   "Title: ... — PASS"
+#   "# ... — PASS"
+#   "**Verdict:** PASS"  /  "**Result:** PASS"  /  "**Result: PASS**"
+#   "VERDICT: PASS"  (machine-readable sentinel)
 report_passes() {
   local file="$1"
-  # Accept multiple verdict formats:
-  #   "Title: ... — PASS"
-  #   "# Title — PASS"
-  #   "**Verdict:** PASS"
-  #   "**Result:** PASS" or "**Result: PASS**"
-  grep -qE "(Title:|##? .+).*— PASS|\*\*(Verdict|Result)[: ]+PASS(\*\*)?" "$file" 2>/dev/null
+  python3 - "$file" <<'PYEOF'
+import re, sys
+try:
+    with open(sys.argv[1]) as fh:
+        head = [next(fh, '') for _ in range(10)]
+except Exception:
+    sys.exit(1)
+pattern = re.compile(
+    r'(Title:|#{1,2}\s.+|VERDICT:).*\bPASS\b'
+    r'|\*\*(Verdict|Result)[: ]+PASS(\*\*)?',
+    re.IGNORECASE
+)
+sys.exit(0 if any(pattern.search(line) for line in head) else 1)
+PYEOF
 }
 
 # Returns accumulated build context, capped at CONTEXT_MAX_CHARS (most recent tasks).
@@ -403,29 +418,49 @@ ts_files = [os.path.join(repo_root, f) for f in files
 
 report = {'task_id': task_id, 'files_checked': files}
 
-# ── Complexity: flag functions > 20 lines ────────────────────────────────────
+# ── Complexity: parse Biome JSON output for noExcessiveCognitiveComplexity ───
+# Biome --reporter=json emits structured diagnostics including the rule name
+# and the cognitive complexity score extracted from the message text.
+# This replaces the fragile line-counting regex heuristic.
 complex_fns = []
-for fp in ts_files:
+if ts_files:
     try:
-        content = open(fp).read()
-        # Simple heuristic: find function/method bodies by counting lines between braces
-        for m in re.finditer(r'(?:function\s+\w+|(?:async\s+)?\w+\s*\([^)]*\)\s*(?::\s*\S+\s*)?)\s*\{',
-                             content):
-            start_line = content[:m.start()].count('\n') + 1
-            # Count to matching closing brace
-            depth, i = 1, m.end()
-            while i < len(content) and depth > 0:
-                if content[i] == '{':
-                    depth += 1
-                elif content[i] == '}':
-                    depth -= 1
-                i += 1
-            end_line = content[:i].count('\n') + 1
-            length = end_line - start_line
-            if length > 20:
-                rel = os.path.relpath(fp, repo_root)
-                complex_fns.append({'file': rel, 'line': start_line, 'lines': length})
-    except Exception:
+        r = subprocess.run(
+            ['pnpm', 'exec', 'biome', 'check', '--reporter=json', *ts_files],
+            capture_output=True, text=True, cwd=repo_root, timeout=60
+        )
+        # Biome writes JSON to stdout; exit code non-zero when violations found
+        if r.stdout.strip():
+            biome_out = json.loads(r.stdout)
+            for diag in biome_out.get('diagnostics', []):
+                # Filter to complexity rule only
+                category = diag.get('category', '')
+                if 'noExcessiveCognitiveComplexity' not in category:
+                    continue
+                # Extract file and line from the first span
+                spans = diag.get('advices', {}).get('advices', [])
+                location = diag.get('location', {})
+                fp = location.get('path', {}).get('file', '')
+                line = (location.get('span', [0])[0] or 0)
+                # Extract score from message, e.g. "Excessive complexity of 14 detected"
+                msg = diag.get('message', '')
+                score_match = re.search(r'complexity of (\d+)', msg)
+                score = int(score_match.group(1)) if score_match else 0
+                rel = os.path.relpath(fp, repo_root) if fp else fp
+                # Convert byte offset to line number if needed
+                if fp and os.path.isfile(fp) and isinstance(line, int) and line > 1000:
+                    # Biome reports byte offset, convert to line
+                    try:
+                        content = open(fp, 'rb').read()
+                        line = content[:line].count(b'\n') + 1
+                    except Exception:
+                        pass
+                complex_fns.append({
+                    'file': rel,
+                    'line': line,
+                    'score': score,
+                })
+    except (json.JSONDecodeError, Exception):
         pass
 report['complex_functions'] = complex_fns[:10]  # cap at 10
 
@@ -477,9 +512,10 @@ if coverage_pct is not None:
 if duplication_pct is not None:
     parts.append(f'dup {duplication_pct}%')
 if complex_fns:
-    parts.append(f'{len(complex_fns)} complex fn(s)')
+    parts.append(f'{len(complex_fns)} complexity violation(s)')
     for fn in complex_fns[:3]:
-        parts_detail = f"    {fn['file']}:{fn['line']} ({fn['lines']} lines)"
+        score_str = f" (score {fn['score']})" if fn.get('score') else ''
+        parts_detail = f"    {fn['file']}:{fn['line']}{score_str}"
         print(parts_detail)
 if parts:
     print(f'  {prefix}' + ' · '.join(parts))
@@ -493,6 +529,7 @@ data = json.load(open(metrics_file))
 if task_id in data.get('tasks', {}):
     data['tasks'][task_id]['health'] = {
         'complex_fn_count': len(complex_fns),
+        'max_complexity_score': max((f.get('score', 0) for f in complex_fns), default=0),
         'duplication_pct': duplication_pct,
         'coverage_pct': coverage_pct,
     }
@@ -624,10 +661,21 @@ if [ "$PHASE" -gt 1 ]; then
   fi
 fi
 
+if [[ "${SKIP_ARCHITECT:-}" == "1" ]]; then
+  log "SKIP_ARCHITECT=1 — skipping AG-01, AG-02, and human gate"
+  if [ ! -f "$PIPELINE_DIR/task-manifest.json" ]; then
+    halt "task-manifest.json not found" "orchestrator" \
+      "SKIP_ARCHITECT=1 requires task-manifest.json to already exist in $PIPELINE_DIR/"
+  fi
+  log "task-manifest.json found — proceeding to task execution"
+fi
+
 # ── Header ────────────────────────────────────────────────────────────────────
 log "========================================"
 log "{PROJECT_NAME} Pipeline — Phase $PHASE"
 log "========================================"
+
+if [[ "${SKIP_ARCHITECT:-}" != "1" ]]; then
 
 # ── AG-01 Architect ───────────────────────────────────────────────────────────
 log ""
@@ -707,6 +755,36 @@ print(result)
 PYEOF
 )
 
+# Produce a compact repo file tree for the Architect so it can name real files
+# in files_in_scope. Excludes noise directories. Capped at 300 lines to stay
+# within a sensible context budget.
+REPO_FILE_TREE=$(python3 - "$REPO_ROOT" <<'PYEOF'
+import os, sys
+
+root = sys.argv[1]
+skip = {
+    'node_modules', '.git', 'dist', 'build', 'coverage',
+    'pipeline', '.turbo', '.next', '__pycache__', '.cache',
+}
+lines = []
+for dirpath, dirnames, filenames in os.walk(root):
+    # Prune skip dirs in-place so os.walk doesn't descend into them
+    dirnames[:] = sorted(d for d in dirnames if d not in skip and not d.startswith('.'))
+    rel = os.path.relpath(dirpath, root)
+    depth = 0 if rel == '.' else rel.count(os.sep) + 1
+    indent = '  ' * depth
+    folder = os.path.basename(dirpath) if rel != '.' else '.'
+    lines.append(f"{indent}{folder}/")
+    for fname in sorted(filenames):
+        lines.append(f"{indent}  {fname}")
+    if len(lines) > 300:
+        lines.append("  ... (truncated)")
+        break
+
+print('\n'.join(lines[:300]))
+PYEOF
+)
+
 ARCH_PROMPT="You are running as AG-01 Architect for {PROJECT_NAME}.
 
 Here is the PRD content for Phase $PHASE:
@@ -719,11 +797,32 @@ Here is the Architecture document:
 $ARCH_DOC
 </architecture>
 
+Here is the current repository file tree (use this to assign real, existing paths in files_in_scope):
+<repo-file-tree>
+$REPO_FILE_TREE
+</repo-file-tree>
+
 Produce the task manifest for Phase $PHASE.
 
 Write two files to pipeline/phase-$PHASE/:
 1. task-manifest.json
 2. manifest-summary.md
+
+STRICT SCHEMA REQUIREMENT — every task object in task-manifest.json MUST have ALL of these fields
+with EXACTLY these types and allowed values. The manifest will be machine-validated and will be
+rejected if any field is missing or uses a non-allowed value:
+
+  {
+    "id":                   string   — e.g. "task-1" (sequential, no other format)
+    "title":                string
+    "description":          string
+    "files_in_scope":       string[] — MUST be non-empty; use exact repo paths from the file tree above
+    "dependencies":         string[] — task ids; use [] if none
+    "acceptance_criteria":  string[] — MUST be non-empty; each item must be a specific testable statement
+    "security_sensitive":   boolean  — true or false (REQUIRED — never omit this field)
+    "estimated_complexity": string   — MUST be exactly one of: "low", "medium", "high"
+                                       DO NOT use XS, S, M, L, XL, or any other value
+  }
 
 Follow your system prompt exactly."
 
@@ -788,6 +887,14 @@ PYEOF
 )
 
 if [ -n "$SCHEMA_ERRORS" ]; then
+  # Write debug info to a file so the workflow can always cat it
+  {
+    echo "=== SCHEMA VALIDATION ERRORS ==="
+    echo "$SCHEMA_ERRORS"
+    echo ""
+    echo "=== RAW MANIFEST ==="
+    cat "$PIPELINE_DIR/task-manifest.json" 2>/dev/null || echo "(manifest file not found)"
+  } | tee "$PIPELINE_DIR/schema-errors.txt"
   halt "task-manifest.json failed schema validation" "AG-01" \
     "Fix these issues in the manifest before proceeding:
 $SCHEMA_ERRORS"
@@ -907,6 +1014,12 @@ if [ ! -f "$SUMMARY_FILE" ]; then
   halt "reviewer-summary.md not produced" "AG-02" "Reviewer did not write the summary file"
 fi
 
+if [[ "${ARCHITECT_ONLY:-}" == "1" ]]; then
+  log "ARCHITECT_ONLY=1 — planning complete, exiting before human gate"
+  log "Manifest and reviewer summary written to $PIPELINE_DIR/"
+  exit 0
+fi
+
 # ── Human gate ────────────────────────────────────────────────────────────────
 
 APPROVAL=$(wait_for_approval)
@@ -975,6 +1088,8 @@ data['approved_at'] = '$(date -u +"%Y-%m-%dT%H:%M:%SZ")'
 with open('$PIPELINE_DIR/approval.json', 'w') as f:
     json.dump(data, f, indent=2)
 "
+
+fi # end of SKIP_ARCHITECT != 1 block
 
 # ── Task loop ─────────────────────────────────────────────────────────────────
 TASKS=$(python3 -c "
@@ -1173,6 +1288,30 @@ $SCOPE_VIOLATIONS"
         GATE_FAILURES=""
       fi
 
+      # Guard: if all changes were reverted (scope violations) but no in-scope
+      # file was actually written, the developer produced no real implementation.
+      # Force a retry so the agent writes code in the correct files.
+      if [ -z "$GATE_FAILURES" ] && [ -n "$SCOPE_VIOLATIONS" ]; then
+        IN_SCOPE_CHANGED=$(python3 -c "
+import json, subprocess, sys
+files = json.loads(sys.argv[1])
+repo  = sys.argv[2]
+result = subprocess.run(
+    ['git', '-C', repo, 'diff', '--name-only', 'HEAD'],
+    capture_output=True, text=True
+)
+changed = set(result.stdout.splitlines())
+print('yes' if any(f in changed for f in files) else 'no')
+" "$FILES_IN_SCOPE_JSON" "$REPO_ROOT" 2>/dev/null || echo "no")
+        if [ "$IN_SCOPE_CHANGED" = "no" ]; then
+          GATE_FAILURES="${SCOPE_GATE}
+=== No in-scope files were modified ===
+All of your changes were in files outside files_in_scope and have been reverted.
+You MUST write implementation code to the files listed in files_in_scope.
+Do not create new files — modify only the files already listed there."
+        fi
+      fi
+
       if [ -z "$GATE_FAILURES" ]; then
         GREEN_PASSED=true
         echo "green-verified" > "$GREEN_VERIFIED_FILE"
@@ -1262,6 +1401,25 @@ Follow your system prompt exactly."
     REFACTOR_START=$(date +%s)
     log "REFACTOR phase — AG-06 Refactor..."
 
+    # Build complexity violation list from the pre-refactor health report
+    COMPLEXITY_BLOCK=$(python3 - "$TASK_DIR/health-report-pre.json" <<'PYEOF'
+import json, sys, os
+try:
+    report = json.load(open(sys.argv[1]))
+    fns = report.get('complex_functions', [])
+    if not fns:
+        sys.exit(0)
+    print("The following functions exceeded the cognitive complexity threshold (max: 10).")
+    print("These are your primary refactor targets — reduce their complexity score:")
+    print("")
+    for fn in fns:
+        score = fn.get('score', '?')
+        print(f"  {fn['file']}:{fn['line']} — complexity score {score}")
+except Exception:
+    pass
+PYEOF
+)
+
     REFACTOR_PROMPT="You are AG-06 Refactor for {PROJECT_NAME}.
 
 The Developer has implemented task $TASK_ID and all tests pass.
@@ -1271,7 +1429,11 @@ Task spec:
 $TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
+${COMPLEXITY_BLOCK:+
+## Complexity violations to fix
 
+$COMPLEXITY_BLOCK
+}
 Read every file in files_in_scope and the corresponding test files.
 Make conservative, targeted improvements only.
 Do NOT modify test files. Do NOT change public interfaces.
@@ -1374,6 +1536,8 @@ PYEOF
 Review all code written for task $TASK_ID.
 Task spec:
 $TASK_SPEC
+${CONTEXT_BLOCK:+
+$CONTEXT_BLOCK}
 
 Apply every rule in .opencode/agents/security-rules.md to every file in files_in_scope.
 Write security-report.md to pipeline/phase-$PHASE/$TASK_ID/
@@ -1406,10 +1570,15 @@ $(cat "$SEC_REPORT")
 
 Task spec for context:
 $TASK_SPEC
+${CONTEXT_BLOCK:+
+$CONTEXT_BLOCK}
 
-Do not introduce new issues. Do not modify test files.
-Update self-assessment.md after fixing.
-Use process.env.DATABASE_URL for any database connections."
+Constraints:
+- Only modify files listed in files_in_scope: $(python3 -c "import json,sys; print(', '.join(json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")
+- Do not modify test files.
+- Your changes must not break tsc, eslint, or pnpm test — the hard gate runs immediately after.
+- Update self-assessment.md after fixing.
+- Use process.env.DATABASE_URL for any database connections."
 
       run_agent "ag-04-developer" "$SEC_FIX_PROMPT" \
         "$TASK_DIR/dev-secfix-$SECURITY_ATTEMPTS.md"
@@ -1570,9 +1739,13 @@ log "========================================"
 VALIDATION_PASSED=false
 VALIDATION_ATTEMPTS=0
 
-while [ "$VALIDATION_PASSED" = false ] && [ "$VALIDATION_ATTEMPTS" -lt 2 ]; do
+# Maximum fix+re-validate cycles after an initial FAIL.
+# Cycle: AG-08 FAIL → AG-04 fix → hard gate → AG-08 retry.
+MAX_VALIDATION_CYCLES=2
+
+while [ "$VALIDATION_PASSED" = false ] && [ "$VALIDATION_ATTEMPTS" -lt $(( MAX_VALIDATION_CYCLES + 1 )) ]; do
   VALIDATION_ATTEMPTS=$(( VALIDATION_ATTEMPTS + 1 ))
-  log "Validation attempt $VALIDATION_ATTEMPTS/2..."
+  log "Validation attempt $VALIDATION_ATTEMPTS/$(( MAX_VALIDATION_CYCLES + 1 ))..."
 
   VAL_PROMPT="You are AG-08 Validator for {PROJECT_NAME}.
 
@@ -1588,12 +1761,12 @@ On PASS:
 - Write the validation-report.md with PASS, changelog, and full sign-off
 
 On FAIL:
-- List exactly which exit criteria failed and why
+- List exactly which exit criteria failed and why, with the task ID and file responsible
 - Do not create a git tag
 
 Follow your system prompt exactly."
 
-  run_agent "ag-08-validator" "$VAL_PROMPT" "$PIPELINE_DIR/val-output.md"
+  run_agent "ag-08-validator" "$VAL_PROMPT" "$PIPELINE_DIR/val-output-$VALIDATION_ATTEMPTS.md"
 
   if [ -f "$PIPELINE_DIR/validation-report.md" ] && report_passes "$PIPELINE_DIR/validation-report.md"; then
     VALIDATION_PASSED=true
@@ -1601,13 +1774,79 @@ Follow your system prompt exactly."
     printf "\a"  # terminal bell
     log ""
     log "========================================"
-    log "✅ Phase $PHASE: COMPLETE"
+    log "Phase $PHASE: COMPLETE"
     log "Git tag: phase-$PHASE-complete created"
     log "========================================"
   else
-    log "Validation: FAIL (attempt $VALIDATION_ATTEMPTS/2)"
-    if [ "$VALIDATION_ATTEMPTS" -eq 2 ]; then
-      halt "Phase validation failed after 2 attempts" "AG-08" "See pipeline/phase-$PHASE/validation-report.md"
+    log "Validation: FAIL (attempt $VALIDATION_ATTEMPTS/$(( MAX_VALIDATION_CYCLES + 1 )))"
+
+    if [ "$VALIDATION_ATTEMPTS" -ge $(( MAX_VALIDATION_CYCLES + 1 )) ]; then
+      halt "Phase validation failed after $VALIDATION_ATTEMPTS attempt(s)" "AG-08" \
+        "See pipeline/phase-$PHASE/validation-report.md"
+    fi
+
+    # ── Validation fix cycle ─────────────────────────────────────────────────
+    # The validator identified specific exit-criteria failures. Re-run the
+    # developer on every affected task so the code is actually fixed before
+    # we ask the validator to look again.
+    log "Validation fix cycle $VALIDATION_ATTEMPTS — running Developer against validator findings..."
+
+    VAL_FIX_PROMPT="You are AG-04 Developer for {PROJECT_NAME}.
+
+The Phase $PHASE Validator has rejected the implementation. Fix every issue listed below.
+
+<validation-findings>
+$(cat "$PIPELINE_DIR/validation-report.md")
+</validation-findings>
+
+Phase context (all tasks):
+$(build_context_block)
+
+Rules:
+- Only modify files that belong to the failing exit criteria.
+- Do not modify test files.
+- After fixing, update self-assessment.md in the relevant task directory with a summary
+  of what you changed and why.
+- Use process.env.DATABASE_URL for any database connections.
+
+Apply all security rules. Do not introduce new issues."
+
+    run_agent "ag-04-developer" "$VAL_FIX_PROMPT" \
+      "$PIPELINE_DIR/val-fix-dev-$VALIDATION_ATTEMPTS.md"
+
+    # Re-run the full hard gate across all tasks so we know nothing regressed
+    log "Re-running full hard gate after validation fix..."
+    PHASE_GATE_FAILURES=""
+    while IFS= read -r VTASK_ID; do
+      [[ -z "$VTASK_ID" ]] && continue
+      VTASK_FILES_JSON=$(python3 -c "
+import json
+data = json.load(open('$PIPELINE_DIR/task-manifest.json'))
+tasks = data if isinstance(data, list) else data.get('tasks', [])
+task = next((t for t in tasks if isinstance(t, dict) and t['id'] == '$VTASK_ID'), None)
+print(json.dumps(task.get('files_in_scope', []) if task else []))
+")
+      VTASK_FAILURES=$(verify_implementation "$VTASK_FILES_JSON") || true
+      if [ -n "$VTASK_FAILURES" ]; then
+        PHASE_GATE_FAILURES+="=== $VTASK_ID ===
+$VTASK_FAILURES
+
+"
+      fi
+    done <<< "$TASKS"
+
+    if [ -n "$PHASE_GATE_FAILURES" ]; then
+      halt "Validation fix broke the hard gate" "AG-04" \
+        "Fix introduced regressions — see below:
+$PHASE_GATE_FAILURES"
+    fi
+    log "Post-validation-fix hard gate: PASS — retrying validator..."
+
+    # Scope-compliance check after the fix (informational revert, not a halt)
+    SCOPE_VIOLATIONS=$(check_scope_compliance "[]") || true
+    if [ -n "$SCOPE_VIOLATIONS" ]; then
+      log "Reverting out-of-scope changes from validation fix..."
+      revert_scope_violations <<< "$SCOPE_VIOLATIONS"
     fi
   fi
 done
