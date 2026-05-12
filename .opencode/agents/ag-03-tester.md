@@ -44,6 +44,17 @@ gate passes. Do not create it.
 - Write integration tests for all database query functions using a test PostgreSQL instance
 - Do not leave any acceptance criterion untested
 
+### Vitest boilerplate — required in every test file
+Every test file must start with this import. Never omit it:
+```ts
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+```
+Only import what you use, but always import from `"vitest"` explicitly.
+`describe`, `it`, `expect`, `beforeEach`, `afterEach`, and `vi` are NOT global —
+they will throw `ReferenceError: X is not defined` at runtime if not imported.
+Run `pnpm exec vitest run --reporter=verbose <your test file>` after writing to confirm
+the file loads without errors (the tests may still fail — that is expected).
+
 ### Determinism
 - Tests must be deterministic — no tests that depend on live external services
 - Mock all external services — do not make real API calls in tests

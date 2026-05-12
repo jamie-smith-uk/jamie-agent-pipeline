@@ -1464,6 +1464,29 @@ Follow your system prompt exactly."
       log "RED confirmed — tests fail as expected"
     fi
 
+    # Sanity check: if every new test file shows 0 tests run (load error),
+    # the tester's file is broken (e.g. missing vitest imports). Halt early so
+    # the developer doesn't waste attempts working around a bad test file.
+    NEW_TEST_FILES=$(git -C "$REPO_ROOT" diff --name-only HEAD 2>/dev/null | grep '\.test\.ts$' || true)
+    if [ -n "$NEW_TEST_FILES" ]; then
+      ZERO_TEST_COUNT=0
+      NONZERO_TEST_COUNT=0
+      while IFS= read -r tf; do
+        if grep -q "^.*$tf.*(0 test)" "$TASK_DIR/test-red-output.txt" 2>/dev/null; then
+          ZERO_TEST_COUNT=$((ZERO_TEST_COUNT + 1))
+        else
+          NONZERO_TEST_COUNT=$((NONZERO_TEST_COUNT + 1))
+        fi
+      done <<< "$NEW_TEST_FILES"
+      if [ "$ZERO_TEST_COUNT" -gt 0 ] && [ "$NONZERO_TEST_COUNT" -eq 0 ]; then
+        log "ERROR: All new test files ran 0 tests — likely a load error (missing vitest import, syntax error, etc.)"
+        log "Test files with 0 tests: $ZERO_TEST_COUNT"
+        log "Check $TASK_DIR/test-red-output.txt for details"
+        halt "Tester produced broken test files (0 tests ran)" "AG-03" \
+          "Task: $TASK_ID — all new test files loaded with 0 tests. Check for missing 'import { describe, it, expect } from \"vitest\"'."
+      fi
+    fi
+
     # Capture baseline failing test IDs so the green gate can distinguish
     # pre-existing failures (infrastructure, unrelated packages) from new ones
     # introduced or missed by the developer.

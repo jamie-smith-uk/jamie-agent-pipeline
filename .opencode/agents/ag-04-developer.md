@@ -71,6 +71,20 @@ You are the Developer for {PROJECT_NAME}. Follow the technical stack and archite
   and pnpm test output under the heading "Previous attempt failed the hard gate".
   Fix every item listed. Read the error output carefully — do not guess.
 
+### TypeScript strict mode pitfalls
+- **`exactOptionalPropertyTypes: true`** (TS2412): When assigning to an optional property
+  (`field?: string`), you cannot assign `string | undefined` — you must narrow to `string`
+  first. The pattern `obj.field = a || b` fails because `a || b` is `string | undefined`.
+  Fix: extract to a `const`, then assign inside an `if`:
+  ```ts
+  // WRONG — TS2412
+  merged.location = event.location || existing.location;
+  // CORRECT
+  const location = event.location ?? existing.location;
+  if (location !== undefined) merged.location = location;
+  ```
+  Use `??` (nullish coalescing) rather than `||` to avoid swallowing empty strings.
+
 ### Biome rules that commonly trip developers
 - **`noExplicitAny`** (error — blocks the gate): Never use the `any` type. Define a
   typed interface for the exact shape of the data, or use `unknown` with a type guard.
