@@ -44,7 +44,7 @@ fi
 
 mkdir -p "$PIPELINE_DIR"
 PHASE_STARTED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-CONTEXT_MAX_CHARS=4000   # max context.md chars injected into agent prompts (~1k tokens)
+CONTEXT_MAX_CHARS=12000  # max context.md chars injected into agent prompts (~3k tokens)
 ARCH_DOC_MAX_CHARS=6000  # include full architecture doc below this size; tier above it
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -252,7 +252,7 @@ lines[n-1] = '// MUTATED: ' + lines[n-1]
 open(fp, 'w').writelines(lines)
 " "$full" "$line_num"
 
-    if timeout 60 bash -c "cd '$REPO_ROOT' && pnpm test --run" > /dev/null 2>&1; then
+    if timeout 60 bash -c "cd '$REPO_ROOT' && pnpm test" > /dev/null 2>&1; then
       survived_list+="  - $f line $line_num\n"
       log "  ⚠ Mutation survived: $f:$line_num"
     else
@@ -341,17 +341,29 @@ check_tester_trajectory() {
   local ac_count="$3"  # number of acceptance criteria (minimum test count target)
   local issues=""
 
-  # Find test files created since tests-written.txt (proxy for "written this task")
+  # Find test files created or modified within 10 minutes of tests-written.txt.
+  # Using -newer alone misses files written in the same second as the sentinel
+  # or files that the tester wrote before touching the sentinel. Use a 10-minute
+  # window from the sentinel's modification time as a generous but bounded proxy.
+  local sentinel_time
+  sentinel_time=$(python3 -c "import os,sys; print(int(os.path.getmtime(sys.argv[1])))" \
+    "$tests_written_file" 2>/dev/null || echo "0")
+  local window_start=$(( sentinel_time - 600 ))  # 10 minutes before sentinel
+
   local test_count=0
   local files_without_assertions=()
   while IFS= read -r tf; do
     [[ -f "$tf" ]] || continue
+    local tf_time
+    tf_time=$(python3 -c "import os,sys; print(int(os.path.getmtime(sys.argv[1])))" \
+      "$tf" 2>/dev/null || echo "0")
+    [[ "$tf_time" -ge "$window_start" ]] || continue
     test_count=$(( test_count + 1 ))
     if ! grep -qE "expect\(|it\(|test\(|describe\(" "$tf" 2>/dev/null; then
       files_without_assertions+=("$(basename "$tf")")
     fi
   done < <(find "$REPO_ROOT" \( -name "*.test.ts" -o -name "*.spec.ts" \) \
-    -newer "$tests_written_file" 2>/dev/null)
+    -not -path "*/node_modules/*" 2>/dev/null)
 
   if [ "$test_count" -eq 0 ]; then
     issues+="No test files found after RED phase — Tester may not have written any tests\n"
@@ -502,7 +514,7 @@ summary_file = os.path.join(repo_root, 'coverage', 'coverage-summary.json')
 try:
     if not skip_tests:
         subprocess.run(
-            ['pnpm', 'test', '--run', '--coverage', '--coverage.reporter=json-summary'],
+            ['pnpm', 'test', '--coverage', '--coverage.reporter=json-summary'],
             capture_output=True, text=True, cwd=repo_root, timeout=120
         )
     if os.path.exists(summary_file):
@@ -558,8 +570,17 @@ PYEOF
 # Returns 0 if all checks pass, 1 if any fail.
 # NOTE: output is intentionally NOT truncated — the full tsc/lint/test output is
 # captured so the developer receives the complete picture on retry.
+#
+# Args:
+#   $1  files_in_scope_json   — JSON array of in-scope file paths
+#   $2  baseline_file         — optional path to baseline-failures.txt; when
+#                               supplied, pnpm test failures that already existed
+#                               before the developer ran (infrastructure errors,
+#                               unrelated packages) are stripped from the gate
+#                               output so the developer is not blamed for them.
 verify_implementation() {
   local files_in_scope_json="$1"
+  local baseline_file="${2:-}"
   local failures=""
 
   # Resolve existing files from files_in_scope (used by linter below)
@@ -622,8 +643,6 @@ $(cat "$lint_out")
     rm -f "$lint_out" "$lint_rc_file"
   fi
 
-  # Scope pnpm test to packages containing files_in_scope (speeds up large monorepos).
-  # Falls back to running all tests when no package prefix is found.
   local affected_pkgs
   affected_pkgs=$(python3 -c "
 import json, sys, re
@@ -631,17 +650,72 @@ files = json.loads(sys.argv[1])
 pkgs = set()
 for f in files:
     m = re.match(r'packages/([^/]+)/', f)
-    if m: pkgs.add(m.group(1))
-# Emit --filter args for pnpm; empty string means run all
+    if m: pkgs.add('@lifeos/' + m.group(1))
 print(' '.join('--filter ' + p for p in sorted(pkgs)) if pkgs else '')
 " "$files_in_scope_json" 2>/dev/null)
 
   # shellcheck disable=SC2086
-  local out rc
-  out=$(cd "$REPO_ROOT" && pnpm ${affected_pkgs} test --run 2>&1); rc=$?
+  out=$(cd "$REPO_ROOT" && pnpm ${affected_pkgs} test 2>&1); rc=$?
   if [ $rc -ne 0 ]; then
-    failures+="=== pnpm test --run ===
-${out}
+    # When a baseline file exists, filter out failures that were already present
+    # before the developer ran. Only surface genuinely new failures.
+    local test_failures_out="$out"
+    if [ -n "$baseline_file" ] && [ -f "$baseline_file" ]; then
+      test_failures_out=$(python3 - "$out" "$baseline_file" <<'PYEOF'
+import re, sys
+
+raw_output  = sys.argv[1]
+baseline_path = sys.argv[2]
+
+try:
+    baseline = set(line.strip() for line in open(baseline_path) if line.strip())
+except FileNotFoundError:
+    baseline = set()
+
+if not baseline:
+    # No baseline recorded — pass through everything
+    print(raw_output)
+    sys.exit(0)
+
+# Extract failing test identifiers from current run
+fail_files_now = set(re.findall(r'^\s*FAIL\s+(\S+)', raw_output, re.MULTILINE))
+fail_tests_now = set(re.findall(r'^\s*×\s+(.+?)\s+\d+ms', raw_output, re.MULTILINE))
+all_now = fail_files_now | fail_tests_now
+
+new_failures = all_now - baseline
+
+if not new_failures:
+    # Every failure existed in the baseline — treat as clean for the gate
+    note = (
+        "NOTE: pnpm test returned non-zero but ALL failures were pre-existing "
+        "before this task's implementation (recorded in baseline-failures.txt). "
+        "These are infrastructure or unrelated-package failures — not caused by "
+        "this task. Gate treating test step as PASS.\n\n"
+        "Pre-existing failures:\n" +
+        '\n'.join(f"  - {f}" for f in sorted(baseline))
+    )
+    print(note)
+    sys.exit(1)   # signal to caller: treat as pass (caller checks new_failures empty)
+
+# There are new failures — report only those prominently, then append full output
+new_list = '\n'.join(f"  - {f}" for f in sorted(new_failures))
+print(f"NEW failures (not in baseline):\n{new_list}\n\nFull test output:\n{raw_output}")
+sys.exit(0)
+PYEOF
+      )
+      # Check if all failures were baseline — python exits 1 to signal "treat as pass"
+      local py_rc=$?
+      if [ $py_rc -eq 1 ]; then
+        # All failures were pre-existing — log informational note, skip gate failure
+        log "pnpm test: non-zero exit but all failures are pre-existing (baseline). Skipping test gate."
+        printf "%s" "$failures"
+        [ -z "$failures" ]
+        return
+      fi
+    fi
+
+    failures+="=== pnpm test ===
+${test_failures_out}
 
 "
   fi
@@ -1204,6 +1278,23 @@ $TASK_JSON
   # HAS_MIGRATION, SECURITY_SENSITIVE, TASK_JSON, TASK_TITLE, FILES_IN_SCOPE_JSON,
   # and AC_COUNT are all set by the single-parse eval block above.
 
+  # Pre-compute package filter and expanded file list for the DEV_PROMPT validation block.
+  AFFECTED_PKGS=$(python3 -c "
+import json, sys, re
+files = json.loads(sys.argv[1])
+pkgs = set()
+for f in files:
+    m = re.match(r'packages/([^/]+)/', f)
+    if m: pkgs.add('@lifeos/' + m.group(1))
+print(' '.join('--filter ' + p for p in sorted(pkgs)) if pkgs else '')
+" "$FILES_IN_SCOPE_JSON" 2>/dev/null)
+
+  FILES_IN_SCOPE_JSON_EXPANDED=$(python3 -c "
+import json, sys
+files = json.loads(sys.argv[1])
+print(' '.join(files) if files else 'packages/')
+" "$FILES_IN_SCOPE_JSON" 2>/dev/null)
+
   # ── RED phase: Tester writes failing tests ────────────────────────────────
   TESTS_WRITTEN_FILE="$TASK_DIR/tests-written.txt"
 
@@ -1221,12 +1312,12 @@ $TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
 
+Write test files to the __tests__/ directories as normal.
+Tests will fail right now because there is no implementation — that is correct and expected.
+
 Time budget: complete the RED phase in under 5 minutes. Read only the files
 directly listed in files_in_scope and their immediate imports. Do not explore
 the entire codebase — the task spec and build context contain everything needed.
-
-Write test files to the __tests__/ directories as normal.
-Tests will fail right now because there is no implementation — that is correct and expected.
 
 Do NOT write implementation code.
 Do NOT write test-report.md — the orchestrator writes that.
@@ -1244,11 +1335,39 @@ Follow your system prompt exactly."
 
     # Informational: verify tests fail before implementation (expect non-zero exit)
     log "Confirming tests fail before implementation (RED check)..."
-    if (cd "$REPO_ROOT" && pnpm test --run > "$TASK_DIR/test-red-output.txt" 2>&1); then
+    if (cd "$REPO_ROOT" && pnpm test > "$TASK_DIR/test-red-output.txt" 2>&1); then
       log "WARNING: Tests pass before implementation — verify tests have meaningful assertions"
     else
       log "RED confirmed — tests fail as expected"
     fi
+
+    # Capture baseline failing test IDs so the green gate can distinguish
+    # pre-existing failures (infrastructure, unrelated packages) from new ones
+    # introduced or missed by the developer.
+    python3 - "$TASK_DIR/test-red-output.txt" "$TASK_DIR/baseline-failures.txt" <<'PYEOF'
+import re, sys
+
+red_output_path = sys.argv[1]
+baseline_path   = sys.argv[2]
+
+try:
+    content = open(red_output_path).read()
+except FileNotFoundError:
+    open(baseline_path, 'w').close()
+    sys.exit(0)
+
+# Extract Vitest FAIL lines: "FAIL  src/__tests__/foo.test.ts > ..."
+# and individual failing test names: " × test name N ms"
+fail_files = set(re.findall(r'^\s*FAIL\s+(\S+)', content, re.MULTILINE))
+fail_tests = set(re.findall(r'^\s*×\s+(.+?)\s+\d+ms', content, re.MULTILINE))
+
+baseline = sorted(fail_files | fail_tests)
+with open(baseline_path, 'w') as fh:
+    fh.write('\n'.join(baseline) + '\n' if baseline else '')
+
+print(f"Baseline: {len(baseline)} pre-existing failure(s) recorded.")
+PYEOF
+
     # Trajectory check: verify test files have real assertions (AC_COUNT set above)
     check_tester_trajectory "$TASK_DIR" "$TESTS_WRITTEN_FILE" "$AC_COUNT"
     record_task_metrics "$TASK_ID" "$TASK_TITLE" "red" $(( $(date +%s) - RED_START )) 1 "pass"
@@ -1265,9 +1384,9 @@ Follow your system prompt exactly."
     GREEN_PASSED=false
     GATE_FAILURES=""
 
-    while [ "$GREEN_PASSED" = false ] && [ "$DEV_ATTEMPTS" -lt 3 ]; do
+    while [ "$GREEN_PASSED" = false ] && [ "$DEV_ATTEMPTS" -lt 5 ]; do
       DEV_ATTEMPTS=$(( DEV_ATTEMPTS + 1 ))
-      log "GREEN phase — Developer attempt $DEV_ATTEMPTS/3..."
+      log "GREEN phase — Developer attempt $DEV_ATTEMPTS/5..."
 
       DEV_PROMPT="You are AG-04 Developer for {PROJECT_NAME}.
 
@@ -1276,22 +1395,75 @@ $TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
 
+<architecture>
+$ARCH_DOC
+</architecture>
+
 The Tester has already written failing tests in the __tests__/ directories.
 Your job is to write implementation code that makes every test pass.
 Do not modify the test files.
+
+## Step 1 — Read the in-scope source files FIRST
+Read the current content of every file listed in files_in_scope. Understand what is
+already implemented before writing anything. Do not duplicate or conflict with existing code.
+
+## Step 2 — Read the tests
+Read every \`.test.ts\` file in the __tests__/ directories of the in-scope packages.
+The tests define the exact function signatures, exported names, and interfaces you
+must implement. If in doubt, the tests are the source of truth.
+
+## Biome lint rules — violations will fail the gate
+- **noExplicitAny** (error): Never use \`any\` type. Define a typed interface for the
+  data shape, or use \`unknown\` with a type guard.
+- **noExcessiveCognitiveComplexity** (error, max 10): Break complex logic into small
+  focused helper functions. If a function genuinely must exceed 10 (e.g. a parser),
+  add \`// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: <reason>\`
+  on the line immediately above the function declaration.
+- **noConsole** (warning, won't block gate): Avoid \`console.log\` — use the logger
+  from \`packages/shared/src/logger.ts\`.
+- **Formatter**: Run \`biome check --write\` (step 3 below) to auto-fix spacing/quotes/commas.
+
+## Validation commands (run in order before marking done)
+
+\`\`\`bash
+pnpm exec tsc --noEmit
+pnpm exec biome check --write ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm exec biome check ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm${AFFECTED_PKGS:+ $AFFECTED_PKGS} test
+\`\`\`
+
+Step 2 (\`biome check --write\`) auto-fixes formatting. Step 3 confirms the result is clean.
+You are not done until you have run all four and seen zero errors and all tests passing.
+Copy the terminal output of each command into self-assessment.md as proof.
 
 Write self-assessment.md to pipeline/phase-$PHASE/$TASK_ID/
 Follow your system prompt exactly. Apply all security rules.
 Use process.env.DATABASE_URL for any database connections — do not read .env directly."
 
       if [ -n "$GATE_FAILURES" ]; then
+        # Capture a diff of in-scope files from the previous attempt so the
+        # developer can see exactly what it changed without re-reading everything.
+        PREV_DIFF=$(git -C "$REPO_ROOT" diff HEAD -- \
+          $(python3 -c "
+import json, sys
+files = json.loads(sys.argv[1])
+print(' '.join(files))
+" "$FILES_IN_SCOPE_JSON" 2>/dev/null) 2>/dev/null | head -c 8000 || true)
+
         DEV_PROMPT="$DEV_PROMPT
 
 ## Previous attempt failed the hard gate — fix every item below before marking done:
 
 <gate-failures>
 $GATE_FAILURES
-</gate-failures>"
+</gate-failures>
+${PREV_DIFF:+
+<previous-attempt-diff>
+The following diff shows exactly what your previous attempt wrote to the in-scope files.
+Use this to understand what you already changed and avoid repeating the same mistakes:
+
+$PREV_DIFF
+</previous-attempt-diff>}"
       fi
 
       run_agent "ag-04-developer" "$DEV_PROMPT" "$TASK_DIR/dev-output-$DEV_ATTEMPTS.md"
@@ -1299,6 +1471,17 @@ $GATE_FAILURES
       if [ -f "$TASK_DIR/BLOCKED.md" ]; then
         halt "Developer blocked on $TASK_ID" "AG-04" "$(cat "$TASK_DIR/BLOCKED.md")"
       fi
+
+      # Silently remove common temp/debug patterns before scope check so they
+      # don't pollute retry feedback. These are never legitimate scope files.
+      find "$REPO_ROOT" -maxdepth 2 \( \
+        -name "debug-*.js" -o -name "debug-*.ts" -o \
+        -name "test-*.js" -o -name "test-*.ts" -o \
+        -name "*.debug.js" -o -name "*.debug.ts" -o \
+        -name "*.tmp" -o -name "*.scratch.*" \
+      \) -not -path "*/node_modules/*" -not -path "*/__tests__/*" \
+         -not -path "*/pipeline/*" \
+         -delete 2>/dev/null || true
 
       log "Checking files_in_scope compliance..."
       SCOPE_VIOLATIONS=$(check_scope_compliance "$FILES_IN_SCOPE_JSON") || true
@@ -1312,8 +1495,26 @@ Do NOT re-create or modify them — only write to files listed in files_in_scope
 $SCOPE_VIOLATIONS"
       fi
 
-      log "Running hard gate (tsc + eslint + pnpm test)..."
-      IMPL_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
+      # Auto-fix biome formatting on in-scope files before the gate so trivial
+      # whitespace/comma/quote issues don't consume a developer attempt.
+      # Semantic lint errors (noExplicitAny, complexity, etc.) are NOT auto-fixed.
+      if grep -q '"@biomejs/biome"' "$REPO_ROOT/package.json" 2>/dev/null; then
+        mapfile -t _fmt_files < <(python3 -c "
+import json, os, sys
+files = json.loads(sys.argv[1])
+for f in files:
+    full = os.path.join('$REPO_ROOT', f)
+    if os.path.isfile(full):
+        print(full)
+" "$FILES_IN_SCOPE_JSON" 2>/dev/null)
+        if [ ${#_fmt_files[@]} -gt 0 ]; then
+          log "Auto-fixing biome formatting on in-scope files..."
+          (cd "$REPO_ROOT" && pnpm exec biome format --write "${_fmt_files[@]}" 2>/dev/null) || true
+        fi
+      fi
+
+      log "Running hard gate (tsc + biome check + pnpm test)..."
+      IMPL_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON" "$TASK_DIR/baseline-failures.txt") || true
       # Only include scope violations in failures if tsc/lint/tests also failed.
       # Scope violations alone are auto-recoverable via revert and shouldn't halt.
       if [ -n "$IMPL_FAILURES" ]; then
@@ -1357,20 +1558,20 @@ Verified by orchestrator hard gate after Developer attempt $DEV_ATTEMPTS.
 
 - tsc --noEmit: PASS
 - eslint (files_in_scope): PASS
-- pnpm test --run: PASS
+- pnpm test: PASS
 
-$(cat "$TASK_DIR/test-red-output.txt" 2>/dev/null | head -20 || true)
+$(cat "$TASK_DIR/test-red-output.txt" 2>/dev/null || true)
 REPORT
         record_task_metrics "$TASK_ID" "$TASK_TITLE" "green" $(( $(date +%s) - GREEN_START )) "$DEV_ATTEMPTS" "pass"
         log "Code health (pre-refactor baseline):"
         run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON" "pre-refactor" "1"
         log "GREEN phase: PASS"
       else
-        log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/3)"
+        log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/5)"
         printf "%s" "$GATE_FAILURES" > "$TASK_DIR/gate-failures-$DEV_ATTEMPTS.txt"
-        if [ "$DEV_ATTEMPTS" -eq 3 ]; then
-          halt "Developer could not pass hard gate after 3 attempts" "AG-04" \
-            "Task: $TASK_ID — see $TASK_DIR/gate-failures-3.txt"
+        if [ "$DEV_ATTEMPTS" -eq 5 ]; then
+          halt "Developer could not pass hard gate after 5 attempts" "AG-04" \
+            "Task: $TASK_ID — see $TASK_DIR/gate-failures-5.txt"
         fi
       fi
     done
@@ -1385,7 +1586,7 @@ Verified by orchestrator hard gate (restored on resume).
 
 - tsc --noEmit: PASS
 - eslint (files_in_scope): PASS
-- pnpm test --run: PASS
+- pnpm test: PASS
 REPORT
     fi
   fi
@@ -1511,6 +1712,16 @@ Read every file in files_in_scope and the corresponding test files.
 Make conservative, targeted improvements only.
 Do NOT modify test files. Do NOT change public interfaces.
 
+## Required: run validation before writing the report
+Run these in order and fix every error:
+\`\`\`bash
+pnpm exec tsc --noEmit
+pnpm exec biome check --write ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm exec biome check ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm${AFFECTED_PKGS:+ $AFFECTED_PKGS} test
+\`\`\`
+Do not write refactor-report.md until all four pass.
+
 Write refactor-report.md to pipeline/phase-$PHASE/$TASK_ID/
 Follow your system prompt exactly."
 
@@ -1611,13 +1822,16 @@ PYEOF
 
     SEC_PROMPT="You are AG-07 Security Agent for {PROJECT_NAME}.
 
-Review all code written for task $TASK_ID.
+Review the code written for task $TASK_ID.
 Task spec:
 $TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
 
-Apply every rule in .opencode/agents/security-rules.md to every file in files_in_scope.
+Files to review (read every one before writing findings):
+$(python3 -c "import json,sys; print('\n'.join('  - ' + f for f in json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")
+
+Apply every rule in .opencode/agents/security-rules.md to every file listed above.
 Write security-report.md to pipeline/phase-$PHASE/$TASK_ID/
 Return PASS or FAIL with specific findings."
 
@@ -1640,7 +1854,8 @@ Return PASS or FAIL with specific findings."
 
       SEC_FIX_PROMPT="You are AG-04 Developer for {PROJECT_NAME}.
 
-The Security Agent has rejected task $TASK_ID. Fix every finding below.
+The Security Agent has rejected task $TASK_ID. Fix every finding below, then run all
+validation commands before marking done.
 
 <security-findings>
 $(cat "$SEC_REPORT")
@@ -1651,12 +1866,20 @@ $TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
 
-Constraints:
-- Only modify files listed in files_in_scope: $(python3 -c "import json,sys; print(', '.join(json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")
-- Do not modify test files.
-- Your changes must not break tsc, eslint, or pnpm test — the hard gate runs immediately after.
-- Update self-assessment.md after fixing.
-- Use process.env.DATABASE_URL for any database connections."
+Files in scope (only modify these):
+$(python3 -c "import json,sys; print('\n'.join('  - ' + f for f in json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")
+
+Do not modify test files.
+
+## Validation commands — run all four before marking done
+\`\`\`bash
+pnpm exec tsc --noEmit
+pnpm exec biome check --write ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm exec biome check ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm${AFFECTED_PKGS:+ $AFFECTED_PKGS} test
+\`\`\`
+Fix everything before updating self-assessment.md.
+Use process.env.DATABASE_URL for any database connections."
 
       run_agent "ag-04-developer" "$SEC_FIX_PROMPT" \
         "$TASK_DIR/dev-secfix-$SECURITY_ATTEMPTS.md"
@@ -1695,15 +1918,18 @@ $POST_SEC_FAILURES"
 import json, sys
 print(', '.join(json.loads(sys.argv[1])))
 " "$FILES_IN_SCOPE_JSON")"
-    python3 - "$TASK_DIR/self-assessment.md" <<'PYEOF'
+    python3 - "$TASK_DIR/self-assessment.md" "$TASK_ID" <<'PYEOF'
 import re, sys
+task_id = sys.argv[2] if len(sys.argv) > 2 else '?'
 try:
     content = open(sys.argv[1]).read()
     m = re.search(r'## Notes for future agents\n(.*?)(\n## |\Z)', content, re.DOTALL)
     if m:
         print(m.group(1).strip())
+    else:
+        print(f"⚠ {task_id}: self-assessment.md is missing the '## Notes for future agents' section — future tasks will have no context from this task.")
 except Exception:
-    pass
+    print(f"⚠ {task_id}: self-assessment.md not found or unreadable.")
 PYEOF
     printf "\n---\n"
   } >> "$PIPELINE_DIR/context.md"

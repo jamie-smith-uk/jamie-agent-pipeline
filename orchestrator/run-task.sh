@@ -215,6 +215,22 @@ print('true' if any('migration' in f.lower() or f.startswith('migrations/') for 
 " "$FILES_IN_SCOPE_JSON")
 AC_COUNT=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1]).get('acceptance_criteria',[])))" "$TASK_JSON")
 
+AFFECTED_PKGS=$(python3 -c "
+import json, sys, re
+files = json.loads(sys.argv[1])
+pkgs = set()
+for f in files:
+    m = re.match(r'packages/([^/]+)/', f)
+    if m: pkgs.add('@lifeos/' + m.group(1))
+print(' '.join('--filter ' + p for p in sorted(pkgs)) if pkgs else '')
+" "$FILES_IN_SCOPE_JSON" 2>/dev/null)
+
+FILES_IN_SCOPE_JSON_EXPANDED=$(python3 -c "
+import json, sys
+files = json.loads(sys.argv[1])
+print(' '.join(files) if files else 'packages/')
+" "$FILES_IN_SCOPE_JSON" 2>/dev/null)
+
 # ── Setup task directory ──────────────────────────────────────────────────────
 SLUG=$(echo "$TASK_ID" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g')
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
@@ -295,7 +311,7 @@ Do NOT write implementation code. Do NOT write test-report.md."
   [ ! -f "$TESTS_WRITTEN_FILE" ] && halt "Tester did not write tests" "AG-03" "tests-written.txt not found"
 
   log "Confirming tests fail before implementation..."
-  if (cd "$REPO_ROOT" && pnpm test --run > "$TASK_DIR/test-red-output.txt" 2>&1); then
+  if (cd "$REPO_ROOT" && pnpm test > "$TASK_DIR/test-red-output.txt" 2>&1); then
     log "WARNING: Tests pass before implementation — verify assertions are meaningful"
   else
     log "RED confirmed — tests fail as expected"
@@ -314,9 +330,9 @@ if [ ! -f "$GREEN_VERIFIED_FILE" ]; then
   GREEN_PASSED=false
   GATE_FAILURES=""
 
-  while [ "$GREEN_PASSED" = false ] && [ "$DEV_ATTEMPTS" -lt 3 ]; do
+  while [ "$GREEN_PASSED" = false ] && [ "$DEV_ATTEMPTS" -lt 5 ]; do
     DEV_ATTEMPTS=$(( DEV_ATTEMPTS + 1 ))
-    log "GREEN phase — Developer attempt $DEV_ATTEMPTS/3..."
+    log "GREEN phase — Developer attempt $DEV_ATTEMPTS/5..."
 
     CONTEXT_BLOCK=$(build_context_block)
     DEV_PROMPT="You are AG-04 Developer for {PROJECT_NAME}.
@@ -324,21 +340,78 @@ Implement this task to make the failing tests pass:
 $TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
-Failing tests are in __tests__/. Make them pass. Do not modify tests.
+
+## Step 1 — Read the in-scope source files FIRST
+Read the current content of every file listed in files_in_scope. Understand what is
+already implemented before writing anything. Do not duplicate or conflict with existing code.
+
+## Step 2 — Read the tests
+Read every \`.test.ts\` file in the __tests__/ directories of the in-scope packages.
+The tests define the exact function signatures, exported names, and interfaces you
+must implement. If in doubt, the tests are the source of truth.
+
+## Biome lint rules — violations will fail the gate
+- **noExplicitAny** (error): Never use \`any\` type. Define a typed interface for the
+  data shape, or use \`unknown\` with a type guard.
+- **noExcessiveCognitiveComplexity** (error, max 10): Break complex logic into small
+  focused helper functions. If a function genuinely must exceed 10 (e.g. a parser),
+  add \`// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: <reason>\`
+  on the line immediately above the function declaration.
+- **noConsole** (warning, won't block gate): Avoid \`console.log\` — use the logger
+  from \`packages/shared/src/logger.ts\`.
+- **Formatter**: Run \`biome check --write\` (step 3 below) to auto-fix spacing/quotes/commas.
+
+## Validation commands (run in order before marking done)
+
+\`\`\`bash
+pnpm exec tsc --noEmit
+pnpm exec biome check --write ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm exec biome check ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm${AFFECTED_PKGS:+ $AFFECTED_PKGS} test
+\`\`\`
+
+Step 2 (\`biome check --write\`) auto-fixes formatting. Step 3 confirms the result is clean.
+You are not done until all four pass with zero errors and all tests passing.
+
 Write self-assessment.md to $TASK_DIR/
 Apply all security rules. Use process.env.DATABASE_URL for DB connections."
 
     if [ -n "$GATE_FAILURES" ]; then
+      PREV_DIFF=$(git -C "$REPO_ROOT" diff HEAD -- \
+        $(python3 -c "
+import json, sys
+files = json.loads(sys.argv[1])
+print(' '.join(files))
+" "$FILES_IN_SCOPE_JSON" 2>/dev/null) 2>/dev/null | head -c 8000 || true)
+
       DEV_PROMPT="$DEV_PROMPT
 
-## Previous attempt failed — fix every item below:
+## Previous attempt failed the hard gate — fix every item below before marking done:
+
 <gate-failures>
 $GATE_FAILURES
-</gate-failures>"
+</gate-failures>
+${PREV_DIFF:+
+<previous-attempt-diff>
+The following diff shows exactly what your previous attempt wrote to the in-scope files.
+Use this to understand what you already changed and avoid repeating the same mistakes:
+
+$PREV_DIFF
+</previous-attempt-diff>}"
     fi
 
     run_agent "ag-04-developer" "$DEV_PROMPT" "$TASK_DIR/dev-output-$DEV_ATTEMPTS.md"
     [ -f "$TASK_DIR/BLOCKED.md" ] && halt "Developer blocked" "AG-04" "$(cat "$TASK_DIR/BLOCKED.md")"
+
+    # Silently remove common temp/debug patterns before scope check.
+    find "$REPO_ROOT" -maxdepth 2 \( \
+      -name "debug-*.js" -o -name "debug-*.ts" -o \
+      -name "test-*.js" -o -name "test-*.ts" -o \
+      -name "*.debug.js" -o -name "*.debug.ts" -o \
+      -name "*.tmp" -o -name "*.scratch.*" \
+    \) -not -path "*/node_modules/*" -not -path "*/__tests__/*" \
+       -not -path "*/pipeline/*" \
+       -delete 2>/dev/null || true
 
     log "Checking files_in_scope compliance..."
     SCOPE_VIOLATIONS=$(check_scope_compliance "$FILES_IN_SCOPE_JSON") || true
@@ -351,7 +424,24 @@ $SCOPE_VIOLATIONS
 Only write to files listed in files_in_scope."
     fi
 
-    log "Running hard gate (tsc + eslint + pnpm test)..."
+    # Auto-fix biome formatting on in-scope files before the gate so trivial
+    # whitespace/comma/quote issues don't consume a developer attempt.
+    if grep -q '"@biomejs/biome"' "$REPO_ROOT/package.json" 2>/dev/null; then
+      mapfile -t _fmt_files < <(python3 -c "
+import json, os, sys
+files = json.loads(sys.argv[1])
+for f in files:
+    full = os.path.join('$REPO_ROOT', f)
+    if os.path.isfile(full):
+        print(full)
+" "$FILES_IN_SCOPE_JSON" 2>/dev/null)
+      if [ ${#_fmt_files[@]} -gt 0 ]; then
+        log "Auto-fixing biome formatting on in-scope files..."
+        (cd "$REPO_ROOT" && pnpm exec biome format --write "${_fmt_files[@]}" 2>/dev/null) || true
+      fi
+    fi
+
+    log "Running hard gate (tsc + biome check + pnpm test)..."
     IMPL_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
     # Only surface scope violations if implementation also failed (L-04 fix).
     # Scope violations alone are already reverted — penalising a passing attempt
@@ -395,17 +485,17 @@ Verified by orchestrator hard gate after Developer attempt $DEV_ATTEMPTS.
 
 - tsc --noEmit: PASS
 - eslint (files_in_scope): PASS
-- pnpm test --run: PASS
+- pnpm test: PASS
 REPORT
       record_task_metrics "$TASK_ID" "$TASK_TITLE" "green" $(( $(date +%s) - GREEN_START )) "$DEV_ATTEMPTS" "pass"
       log "Code health (pre-refactor baseline):"
       run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON" "pre-refactor"
       log "GREEN phase: PASS"
     else
-      log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/3)"
+      log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/5)"
       printf "%s" "$GATE_FAILURES" > "$TASK_DIR/gate-failures-$DEV_ATTEMPTS.txt"
-      [ "$DEV_ATTEMPTS" -eq 3 ] && halt "Developer could not pass hard gate" "AG-04" \
-        "See $TASK_DIR/gate-failures-3.txt"
+      [ "$DEV_ATTEMPTS" -eq 5 ] && halt "Developer could not pass hard gate" "AG-04" \
+        "See $TASK_DIR/gate-failures-5.txt"
     fi
   done
 else
@@ -481,7 +571,19 @@ REFACTOR_EOF
 Improve without changing behaviour: $TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
-Write refactor-report.md to $TASK_DIR/" "$TASK_DIR/refactor-output.md"
+
+Files in scope: ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+
+## Required: run validation before writing the report
+\`\`\`bash
+pnpm exec tsc --noEmit
+pnpm exec biome check --write ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm exec biome check ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm${AFFECTED_PKGS:+ $AFFECTED_PKGS} test
+\`\`\`
+Do not write refactor-report.md until all four pass.
+Write refactor-report.md to $TASK_DIR/
+Follow your system prompt exactly." "$TASK_DIR/refactor-output.md"
     [ ! -f "$TASK_DIR/refactor-report.md" ] && halt "Refactor report not written" "AG-06" ""
   fi
 
@@ -539,9 +641,16 @@ if [ "$OPT_NO_SECURITY" != "true" ] && ! ([ -f "$SEC_REPORT" ] && report_passes 
     log "Security attempt $SECURITY_ATTEMPTS/3..."
 
     run_agent "ag-07-security" "You are AG-07 Security Agent for {PROJECT_NAME}.
-Review all code for: $TASK_SPEC
-Apply every rule in .opencode/agents/security-rules.md to every file in files_in_scope.
-Write security-report.md to $TASK_DIR/" "$TASK_DIR/sec-output-$SECURITY_ATTEMPTS.md"
+
+Review the code written for this task.
+Task spec: $TASK_SPEC
+
+Files to review (read every one before writing findings):
+$(python3 -c "import json,sys; print('\n'.join('  - ' + f for f in json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")
+
+Apply every rule in .opencode/agents/security-rules.md to every file listed above.
+Write security-report.md to $TASK_DIR/
+Return PASS or FAIL with specific findings." "$TASK_DIR/sec-output-$SECURITY_ATTEMPTS.md"
 
     if [ -f "$SEC_REPORT" ] && report_passes "$SEC_REPORT"; then
       SECURITY_PASSED=true
@@ -556,12 +665,29 @@ Write security-report.md to $TASK_DIR/" "$TASK_DIR/sec-output-$SECURITY_ATTEMPTS
         "$(cat "$SEC_REPORT")"
 
       run_agent "ag-04-developer" "You are AG-04 Developer for {PROJECT_NAME}.
-Fix every security finding:
+
+The Security Agent has rejected this task. Fix every finding below, then run all
+validation commands before marking done.
+
 <security-findings>
 $(cat "$SEC_REPORT")
 </security-findings>
-Task context: $TASK_SPEC
-Do not modify test files. Use process.env.DATABASE_URL for DB connections." \
+
+Task spec for context: $TASK_SPEC
+
+Files in scope (only modify these):
+$(python3 -c "import json,sys; print('\n'.join('  - ' + f for f in json.loads(sys.argv[1])))" "$FILES_IN_SCOPE_JSON")
+
+Do not modify test files.
+
+## Validation commands — run all four before marking done
+\`\`\`bash
+pnpm exec tsc --noEmit
+pnpm exec biome check --write ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm exec biome check ${FILES_IN_SCOPE_JSON_EXPANDED:-packages/}
+pnpm${AFFECTED_PKGS:+ $AFFECTED_PKGS} test
+\`\`\`
+Use process.env.DATABASE_URL for DB connections." \
         "$TASK_DIR/dev-secfix-$SECURITY_ATTEMPTS.md"
 
       SCOPE_VIOLATIONS=$(check_scope_compliance "$FILES_IN_SCOPE_JSON") || true

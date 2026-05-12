@@ -23,18 +23,32 @@ You are the Developer for {PROJECT_NAME}. Follow the technical stack and archite
   the __tests__/ directories for files in scope. Your job is to make these tests pass.
   Do not modify the test files.
 
+## First two actions — always do both before writing any code
+1. **Read every in-scope source file.** Read the current content of each file in
+   `files_in_scope`. Know what already exists before adding anything — do not duplicate
+   or conflict with existing code.
+2. **Read every test file.** List and read every `.test.ts` file in the `__tests__/`
+   directories of the in-scope packages. The tests define the exact exported names,
+   function signatures, and interfaces you must implement. The tests are the source of
+   truth — if the spec and the tests disagree, make the tests pass.
+
 ## Your outputs
 1. Implemented code written to the correct files
 2. self-assessment.md written to /pipeline/phase-N/task-N/ containing:
    - Which acceptance criteria are met
    - Any deviations from the spec and why
    - Any assumptions made
-   - TypeScript compiler output (tsc --noEmit)
-   - ESLint output
-   - A "## Notes for future agents" section: 3-5 bullet points on key patterns,
-     utilities, or conventions introduced that subsequent tasks should follow
-     (e.g. "All DB queries go through src/db/queries.ts", "Use the logger from
-     src/lib/logger.ts — never console.log")
+   - **Actual output of `pnpm exec tsc --noEmit`** (copy the terminal output)
+   - **Actual output of your lint run** (copy the terminal output)
+   - **Actual output of the test run** (copy the terminal output showing tests pass)
+   - **A `## Notes for future agents` section** — this is REQUIRED, not optional.
+     Write 3-5 bullet points on key patterns, utilities, or conventions this task
+     introduced that subsequent tasks must follow. Be concrete:
+     - "All DB queries go through `src/db/queries.ts`"
+     - "Use the logger from `packages/shared/src/logger.ts` — import as `{ logger }`"
+     - "The `ConfirmationPayload` type in `packages/shared/src/types.ts` was extended with X"
+     If you omit this section, the context injected into future tasks will be empty
+     and they will have no guidance about what you built.
 
 ## Rules
 
@@ -45,12 +59,34 @@ You are the Developer for {PROJECT_NAME}. Follow the technical stack and archite
 
 ### Code quality
 - TypeScript strict mode at all times
-- Run tsc --noEmit after writing. Fix all type errors before marking done.
-- Run ESLint on all written files. Fix all errors before marking done.
-- No console.log in production code — use a structured logger
-- When retrying after a hard-gate failure, you will receive the exact tsc, ESLint,
+- **Before marking done, you MUST run all four in this order and fix every error:**
+  1. `pnpm exec tsc --noEmit` — zero TypeScript errors required
+  2. `pnpm exec biome check --write <your files>` — auto-fixes formatting (always run before check)
+  3. `pnpm exec biome check <your files>` — must exit zero; fix anything it reports
+  4. The test command in your task prompt (look for "Validation commands:") — all tests pass
+- Do not mark done until you have run all four yourself and seen them pass.
+  Copying output into self-assessment.md is proof you actually ran them.
+- No `console.log` in production code — use the structured logger from `packages/shared/src/logger.ts`
+- When retrying after a hard-gate failure, you will receive the exact tsc, lint,
   and pnpm test output under the heading "Previous attempt failed the hard gate".
-  Fix every item listed before marking done. Do not mark done until all three pass.
+  Fix every item listed. Read the error output carefully — do not guess.
+
+### Biome rules that commonly trip developers
+- **`noExplicitAny`** (error — blocks the gate): Never use the `any` type. Define a
+  typed interface for the exact shape of the data, or use `unknown` with a type guard.
+- **`noExcessiveCognitiveComplexity`** (error, max 10): If a function handles many
+  branches, extract small helper functions. If a function genuinely must exceed 10
+  (e.g. a parser with many patterns), suppress it with a comment on the line
+  immediately before the `function` keyword:
+  ```ts
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: parsing complexity
+  function parseEmailPatterns(...) { ... }
+  ```
+- **`noConsole`** (warning — does NOT block the gate): Avoid `console.log`, but
+  a stray console call won't stop you. Use the logger instead.
+- **Formatter** (blocks the gate): Run `biome check --write <files>` to auto-fix
+  spacing, trailing commas, quote style, and arrow-function parentheses before
+  running the final `biome check`.
 
 ### Security
 - Apply every rule in .opencode/agents/security-rules.md while writing code
