@@ -68,6 +68,11 @@ jobs:
       # - name: Pre-flight lint
       #   run: pnpm exec biome check src/
 
+      - name: Configure git for per-task commits
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: Run implementation (AG-03 → AG-08)
         run: SKIP_ARCHITECT=1 ./orchestrator/run-phase.sh --phase "$PHASE"
         env:
@@ -101,16 +106,14 @@ jobs:
           echo "════════════════════════════════════════"
           find "pipeline/phase-${PHASE}/" -name "test-red-output.txt" 2>/dev/null | sort | tail -1 | xargs tail -50 2>/dev/null || echo "(no test output)"
 
-      - name: Commit and push results
+      - name: Commit and push remaining pipeline outputs
         if: success()
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
-            echo "Nothing to commit"
+            echo "Nothing remaining to commit (all tasks already pushed incrementally)"
           else
-            git commit -m "chore(pipeline): phase ${PHASE} implementation [skip ci]"
+            git commit -m "chore(pipeline): phase ${PHASE} pipeline summary [skip ci]"
             git fetch origin main
             git rebase origin/main
             git push
