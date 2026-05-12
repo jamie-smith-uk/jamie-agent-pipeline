@@ -1575,7 +1575,7 @@ $PREV_DIFF
       fi
 
       run_agent "ag-04-developer" "$DEV_PROMPT" "$TASK_DIR/dev-output-$DEV_ATTEMPTS.md" 1200
-      local dev_rc=$?
+      dev_rc=$?
 
       if [ $dev_rc -eq 124 ]; then
         log "Developer attempt $DEV_ATTEMPTS timed out after 20 minutes — counting as gate failure"
