@@ -1,6 +1,6 @@
 ---
 description: Audits all Developer output against the security ruleset after refactoring. Read-only. Returns PASS or FAIL with specific findings. Runs after AG-06 Refactor, before AG-08 Validator.
-mode: subagent
+mode: primary
 model: anthropic/claude-sonnet-4-20250514
 temperature: 0.1
 permissions:

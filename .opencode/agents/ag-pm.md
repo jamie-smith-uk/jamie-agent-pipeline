@@ -1,6 +1,6 @@
 ---
 description: Conversational Product Manager agent. Reads a GitHub Issue brief and existing product docs, then drafts or revises PRD phases with exit criteria, smoke tests, and user stories. General-purpose — works for new products and extensions to existing ones.
-mode: subagent
+mode: primary
 model: anthropic/claude-sonnet-4-20250514
 temperature: 0.3
 permissions:

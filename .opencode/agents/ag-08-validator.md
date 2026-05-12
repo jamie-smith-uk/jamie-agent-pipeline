@@ -1,7 +1,7 @@
 ---
 description: End-to-end validation of the full phase against PRD exit criteria. Runs smoke tests. Signs off the phase or returns specific failures. Creates Git tag on PASS.
-mode: subagent
-model: anthropic/claude-sonnet-4-20250514
+mode: primary
+model: anthropic/claude-haiku-4-5-20251001
 temperature: 0.1
 permissions:
   write: true

@@ -12,28 +12,17 @@ on:
         required: true
         default: "1"
 
+concurrency:
+  group: pipeline-implement-${{ github.event.inputs.phase }}
+  cancel-in-progress: false
+
 jobs:
   implement:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 340
 
     env:
       PHASE: ${{ github.event.inputs.phase }}
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: lifeos
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          POSTGRES_DB: lifeos
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
 
     steps:
       - name: Checkout
@@ -41,47 +30,48 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Set up Node 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          run_install: false
-          version: 9
+          cache: "pnpm"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Cache opencode-ai
+        id: cache-opencode
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: opencode-ai-1.14.48-${{ runner.os }}
+
       - name: Install opencode
-        run: npm install -g opencode-ai@1.14.48
+        if: steps.cache-opencode.outputs.cache-hit != 'true'
+        run: npm install -g opencode-ai@1.14.48 --prefix ~/.npm-global
+
+      - name: Add opencode to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
 
       - name: Make scripts executable
         run: chmod +x orchestrator/*.sh
 
-      - name: Run pending migrations
-        run: |
-          if [ -d migrations ] && ls migrations/*.sql 2>/dev/null | head -1; then
-            pnpm exec node-pg-migrate up
-          else
-            echo "No migrations to run"
-          fi
-        env:
-          DATABASE_URL: postgresql://lifeos:${{ secrets.POSTGRES_PASSWORD }}@localhost:5432/lifeos
+      # Configure pre-flight checks for your project below.
+      # Examples: pnpm exec tsc --noEmit, pnpm exec biome check src/
+      # - name: Pre-flight quality check
+      #   run: pnpm exec tsc --noEmit
+      # - name: Pre-flight lint
+      #   run: pnpm exec biome check src/
 
       - name: Run implementation (AG-03 → AG-08)
         run: SKIP_ARCHITECT=1 ./orchestrator/run-phase.sh --phase "$PHASE"
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          TODOIST_API_TOKEN: ${{ secrets.TODOIST_API_TOKEN }}
-          POSTGRES_USER: lifeos
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          POSTGRES_DB: lifeos
-          POSTGRES_HOST: localhost
-          POSTGRES_PORT: "5432"
-          DATABASE_URL: postgresql://lifeos:${{ secrets.POSTGRES_PASSWORD }}@localhost:5432/lifeos
 
       - name: Dump debug info on failure
         if: failure()
@@ -94,12 +84,22 @@ jobs:
           echo "════════════════════════════════════════"
           echo "  Gate failures (last attempt)"
           echo "════════════════════════════════════════"
-          find pipeline/ -name "gate-failures-*.txt" | sort | tail -1 | xargs cat 2>/dev/null || echo "(no gate failures file)"
+          find "pipeline/phase-${PHASE}/" -name "gate-failures-*.txt" 2>/dev/null | sort | tail -1 | xargs cat 2>/dev/null || echo "(no gate failures file)"
           echo ""
           echo "════════════════════════════════════════"
-          echo "  dev-output.md (last agent output)"
+          echo "  dev-output.md (last agent output — phase ${PHASE} only)"
           echo "════════════════════════════════════════"
-          find pipeline/ -name "dev-output.md" | sort | tail -1 | xargs cat 2>/dev/null || echo "(no dev output)"
+          find "pipeline/phase-${PHASE}/" -name "dev-output*.md" 2>/dev/null | sort | tail -1 | xargs cat 2>/dev/null || echo "(no dev output for phase ${PHASE})"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  Last opencode output file (any)"
+          echo "════════════════════════════════════════"
+          find "pipeline/phase-${PHASE}/" -name "*-output*.md" 2>/dev/null | sort | tail -1 | xargs cat 2>/dev/null || echo "(no output files)"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  pnpm test output (last)"
+          echo "════════════════════════════════════════"
+          find "pipeline/phase-${PHASE}/" -name "test-red-output.txt" 2>/dev/null | sort | tail -1 | xargs tail -50 2>/dev/null || echo "(no test output)"
 
       - name: Commit and push results
         if: success()
@@ -111,5 +111,7 @@ jobs:
             echo "Nothing to commit"
           else
             git commit -m "chore(pipeline): phase ${PHASE} implementation [skip ci]"
+            git fetch origin main
+            git rebase origin/main
             git push
           fi

@@ -283,6 +283,10 @@ Write the test suite for this task:
 $TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
+Time budget: complete the RED phase in under 5 minutes. Read only the files
+directly listed in files_in_scope and their immediate imports. Do not explore
+the entire codebase — the task spec and build context contain everything needed.
+
 Write test files to __tests__/ directories.
 After writing all tests, write 'tests-written' to: $TASK_DIR/tests-written.txt
 Do NOT write implementation code. Do NOT write test-report.md."
@@ -435,12 +439,53 @@ if [ "$OPT_URGENT" != "true" ] && [ ! -f "$REFACTOR_VERIFIED_FILE" ]; then
   REFACTOR_START=$(date +%s)
   log "REFACTOR phase..."
   CONTEXT_BLOCK=$(build_context_block)
-  run_agent "ag-06-refactor" "You are AG-06 Refactor for {PROJECT_NAME}.
+
+  # Pre-check: skip the agent if health metrics are already within thresholds
+  COMPLEX_COUNT=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(len(d.get('complex_functions', [])))
+except Exception:
+    print(99)
+" "$TASK_DIR/health-report-pre.json" 2>/dev/null || echo 99)
+
+  DUP_PCT=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get('duplication_pct', 99))
+except Exception:
+    print(99)
+" "$TASK_DIR/health-report-pre.json" 2>/dev/null || echo 99)
+
+  METRICS_CLEAN=false
+  if [ "$COMPLEX_COUNT" -lt 5 ] \
+     && python3 -c "import sys; exit(0 if float('$DUP_PCT') < 8.0 else 1)" 2>/dev/null; then
+    METRICS_CLEAN=true
+  fi
+
+  if [ "$METRICS_CLEAN" = "true" ]; then
+    log "REFACTOR phase: metrics clean (complex_fns=${COMPLEX_COUNT}, dup=${DUP_PCT}%) — skipping agent"
+    cat > "$TASK_DIR/refactor-report.md" <<REFACTOR_EOF
+# Refactor Report — $TASK_ID
+
+Skipped: health metrics within thresholds.
+- Complex functions above threshold: ${COMPLEX_COUNT} (limit: 5)
+- Code duplication: ${DUP_PCT}% (limit: 8%)
+
+No refactoring needed.
+REFACTOR_EOF
+  else
+    run_agent "ag-06-refactor" "You are AG-06 Refactor for {PROJECT_NAME}.
 Improve without changing behaviour: $TASK_SPEC
 ${CONTEXT_BLOCK:+
 $CONTEXT_BLOCK}
 Write refactor-report.md to $TASK_DIR/" "$TASK_DIR/refactor-output.md"
-  [ ! -f "$TASK_DIR/refactor-report.md" ] && halt "Refactor report not written" "AG-06" ""
+    [ ! -f "$TASK_DIR/refactor-report.md" ] && halt "Refactor report not written" "AG-06" ""
+  fi
+
+  # Hard gate runs regardless of whether the agent ran
   REFACTOR_FAILURES=$(verify_implementation "$FILES_IN_SCOPE_JSON") || true
   [ -n "$REFACTOR_FAILURES" ] && halt "Refactor broke tests" "AG-06" "$REFACTOR_FAILURES"
   echo "refactor-verified" > "$REFACTOR_VERIFIED_FILE"

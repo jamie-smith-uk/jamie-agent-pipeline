@@ -1,6 +1,6 @@
 ---
 description: Plans the implementation of a phase. Produces an ordered task manifest before any code is written. Read-only — does not modify source files.
-mode: subagent
+mode: primary
 model: anthropic/claude-sonnet-4-20250514
 temperature: 0.2
 permissions:
@@ -44,3 +44,13 @@ You must produce exactly two files, written to /pipeline/phase-N/ where N is the
 - Do not create tasks that are not in the PRD for this phase. Stick strictly to the stories in scope.
 - Do not hallucinate files or dependencies that do not exist in the repo
 - If the phase has no tasks (wrong phase number, already complete), write an empty manifest and explain in the summary
+- estimated_complexity must never be "high". If a task would be high complexity, split it into two or three medium tasks instead. Each split task must have its own id, title, description, files_in_scope, and acceptance_criteria.
+
+## files_in_scope rules
+Always include test infrastructure files alongside any implementation file.
+For every package touched by a task, add to files_in_scope:
+- The package's vitest.config.ts (e.g. packages/foo/vitest.config.ts)
+- The package's tsconfig.json (e.g. packages/foo/tsconfig.json)
+- The relevant test file in __tests__/ if the task introduces a new module (e.g. packages/foo/src/__tests__/bar.test.ts)
+It is cheaper to list files that end up unchanged than to block on a scope violation mid-run.
+Never omit vitest.config.ts or tsconfig.json when a task touches any source file in a package.

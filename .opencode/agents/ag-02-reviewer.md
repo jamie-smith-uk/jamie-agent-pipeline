@@ -1,7 +1,7 @@
 ---
 description: Translates the task manifest into a plain English summary written to a file. The orchestrator displays it in the terminal for human approval. Read-only.
-mode: subagent
-model: anthropic/claude-sonnet-4-20250514
+mode: primary
+model: anthropic/claude-haiku-4-5-20251001
 temperature: 0.1
 permissions:
   write: false
@@ -69,3 +69,13 @@ Then follow with the standard first-pass format for the rest.
 - After writing reviewer-summary.md, halt. The orchestrator handles display and prompting.
 - Do not proceed under any circumstances until the orchestrator writes approval.json.
 - Never interpret silence as approval. Never proceed without an explicit signal.
+
+## Mandatory complexity check
+Before writing the summary, scan every task for `"estimated_complexity": "high"`.
+If any task has high complexity, add a **⚠️ Manifest must be revised** block at the very top
+of reviewer-summary.md (before everything else) listing each high-complexity task by id and title,
+and state: "High-complexity tasks must be split into two or three medium tasks before this manifest
+can be approved. Ask the Architect to revise."
+This overrides the normal summary structure — the human must see this warning first.
+Do not include an `approve` option in the **To proceed** line when this block is present;
+replace it with `changes: split task-N into smaller tasks`.

@@ -1,6 +1,6 @@
 ---
 description: Implements exactly one task at a time from the approved manifest. Receives failing tests from the Tester (RED phase) and implements until they pass. Writes to files in scope only. Never writes tests.
-mode: subagent
+mode: primary
 model: anthropic/claude-sonnet-4-20250514
 temperature: 0.1
 permissions:

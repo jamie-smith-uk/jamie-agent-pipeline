@@ -16,6 +16,10 @@ on:
   issues:
     types: [labeled]
 
+concurrency:
+  group: pipeline-pm-issue-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
   pm-draft:
     runs-on: ubuntu-latest
@@ -34,16 +38,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Set up Node 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
+      - name: Cache opencode-ai
+        id: cache-opencode
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: opencode-ai-1.14.48-${{ runner.os }}
+
       - name: Install opencode
         # PM agent only writes markdown — no project deps needed (C-03 fix)
-        run: npm install -g opencode-ai@1.14.48
+        if: steps.cache-opencode.outputs.cache-hit != 'true'
+        run: npm install -g opencode-ai@1.14.48 --prefix ~/.npm-global
+
+      - name: Add opencode to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
 
       - name: Determine round number
         id: round
