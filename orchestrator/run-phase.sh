@@ -1325,6 +1325,19 @@ with open(manifest_path, 'w') as f:
     log "Ticket splitter — all tasks already small, skipping"
     echo "All tasks within size thresholds — no splitting needed." > "$PIPELINE_DIR/splitter-output.md"
   fi
+
+  # Push splitter output so the next run won't re-split
+  git -C "$REPO_ROOT" add \
+    "pipeline/phase-$PHASE/splitter-output.md" \
+    "pipeline/phase-$PHASE/splitter-agent-log.md" \
+    "pipeline/phase-$PHASE/task-manifest.json" 2>/dev/null || true
+  if ! git -C "$REPO_ROOT" diff --cached --quiet; then
+    git -C "$REPO_ROOT" commit -m "chore(pipeline): phase $PHASE splitter output [skip ci]"
+    git -C "$REPO_ROOT" fetch origin main
+    git -C "$REPO_ROOT" rebase origin/main
+    git -C "$REPO_ROOT" push
+    log "Splitter output pushed"
+  fi
 else
   log "Ticket splitter already ran — skipping"
 fi
@@ -1685,6 +1698,27 @@ REPORT
         record_task_metrics "$TASK_ID" "$TASK_TITLE" "green" $(( $(date +%s) - GREEN_START )) "$DEV_ATTEMPTS" "pass"
         log "Code health (pre-refactor baseline):"
         run_code_health_checks "$TASK_ID" "$TASK_DIR" "$FILES_IN_SCOPE_JSON" "pre-refactor" "1"
+
+        # Push developer's code immediately — don't wait for security/refactor/validator
+        # so a crash in a later gate doesn't lose 14+ minutes of developer work.
+        while IFS= read -r f; do
+          if [ -e "$REPO_ROOT/$f" ] && ! git -C "$REPO_ROOT" check-ignore -q "$f" 2>/dev/null; then
+            git -C "$REPO_ROOT" add "$f"
+          fi
+        done < <(python3 -c "
+import json, sys
+for f in json.loads(sys.argv[1]):
+    print(f)
+" "$FILES_IN_SCOPE_JSON")
+        git -C "$REPO_ROOT" add "$GREEN_VERIFIED_FILE" "$TASK_DIR/test-report.md" "$TASK_DIR/self-assessment.md" 2>/dev/null || true
+        if ! git -C "$REPO_ROOT" diff --cached --quiet; then
+          git -C "$REPO_ROOT" commit -m "wip($TASK_ID): developer green — awaiting security+refactor [skip ci]"
+          git -C "$REPO_ROOT" fetch origin main
+          git -C "$REPO_ROOT" rebase origin/main
+          git -C "$REPO_ROOT" push
+          log "Developer code for $TASK_ID pushed (green gate passed)"
+        fi
+
         log "GREEN phase: PASS"
       else
         log "Hard gate: FAIL (attempt $DEV_ATTEMPTS/5)"
@@ -2081,9 +2115,18 @@ for f in json.loads(sys.argv[1]):
     print(f)
 " "$FILES_IN_SCOPE_JSON")
 
+  # Also stage pipeline sentinel files so next run knows this task is done
+  git -C "$REPO_ROOT" add "pipeline/phase-$PHASE/$TASK_ID/" 2>/dev/null || true
+  git -C "$REPO_ROOT" add "pipeline/phase-$PHASE/task-manifest.json" 2>/dev/null || true
+  git -C "$REPO_ROOT" add "pipeline/phase-$PHASE/context.md" 2>/dev/null || true
+
   if ! git -C "$REPO_ROOT" diff --cached --quiet; then
-    git -C "$REPO_ROOT" commit -m "feat($TASK_ID): $TASK_TITLE"
-    log "Committed: feat($TASK_ID): $TASK_TITLE"
+    git -C "$REPO_ROOT" commit -m "feat($TASK_ID): $TASK_TITLE [skip ci]"
+    # Push immediately so a crash on the next task doesn't lose this work
+    git -C "$REPO_ROOT" fetch origin main
+    git -C "$REPO_ROOT" rebase origin/main
+    git -C "$REPO_ROOT" push
+    log "Committed and pushed: feat($TASK_ID): $TASK_TITLE"
   else
     log "Nothing new to commit for $TASK_ID"
   fi
