@@ -1333,9 +1333,11 @@ with open(manifest_path, 'w') as f:
     "pipeline/phase-$PHASE/task-manifest.json" 2>/dev/null || true
   if ! git -C "$REPO_ROOT" diff --cached --quiet; then
     git -C "$REPO_ROOT" commit -m "chore(pipeline): phase $PHASE splitter output [skip ci]"
+    git -C "$REPO_ROOT" stash push --include-untracked -m "pre-rebase stash" 2>/dev/null || true
     git -C "$REPO_ROOT" fetch origin main
     git -C "$REPO_ROOT" rebase origin/main
     git -C "$REPO_ROOT" push
+    git -C "$REPO_ROOT" stash pop 2>/dev/null || true
     log "Splitter output pushed"
   fi
 else
@@ -1713,9 +1715,11 @@ for f in json.loads(sys.argv[1]):
         git -C "$REPO_ROOT" add "$GREEN_VERIFIED_FILE" "$TASK_DIR/test-report.md" "$TASK_DIR/self-assessment.md" 2>/dev/null || true
         if ! git -C "$REPO_ROOT" diff --cached --quiet; then
           git -C "$REPO_ROOT" commit -m "wip($TASK_ID): developer green — awaiting security+refactor [skip ci]"
+          git -C "$REPO_ROOT" stash push --include-untracked -m "pre-rebase stash" 2>/dev/null || true
           git -C "$REPO_ROOT" fetch origin main
           git -C "$REPO_ROOT" rebase origin/main
           git -C "$REPO_ROOT" push
+          git -C "$REPO_ROOT" stash pop 2>/dev/null || true
           log "Developer code for $TASK_ID pushed (green gate passed)"
         fi
 
@@ -2123,9 +2127,11 @@ for f in json.loads(sys.argv[1]):
   if ! git -C "$REPO_ROOT" diff --cached --quiet; then
     git -C "$REPO_ROOT" commit -m "feat($TASK_ID): $TASK_TITLE [skip ci]"
     # Push immediately so a crash on the next task doesn't lose this work
+    git -C "$REPO_ROOT" stash push --include-untracked -m "pre-rebase stash" 2>/dev/null || true
     git -C "$REPO_ROOT" fetch origin main
     git -C "$REPO_ROOT" rebase origin/main
     git -C "$REPO_ROOT" push
+    git -C "$REPO_ROOT" stash pop 2>/dev/null || true
     log "Committed and pushed: feat($TASK_ID): $TASK_TITLE"
   else
     log "Nothing new to commit for $TASK_ID"
