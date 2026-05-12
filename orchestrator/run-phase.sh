@@ -1252,10 +1252,16 @@ print(', '.join(complete) if complete else 'none')
 " "$PIPELINE_DIR" 2>/dev/null || echo "none")
 
   NEEDS_SPLIT=$(python3 -c "
-import json, sys
-data = json.load(open(sys.argv[1]))
+import json, os, sys
+pipeline_dir, manifest_path = sys.argv[1], sys.argv[2]
+data = json.load(open(manifest_path))
 tasks = data if isinstance(data, list) else data.get('tasks', [])
 for t in tasks:
+    tid = t.get('id', '')
+    # Only consider incomplete tasks
+    sec_report = os.path.join(pipeline_dir, tid, 'security-report.md')
+    if os.path.isfile(sec_report):
+        continue
     c = t.get('estimated_complexity', '')
     acs = len(t.get('acceptance_criteria', []))
     files = len(t.get('files_in_scope', []))
@@ -1263,7 +1269,7 @@ for t in tasks:
         print('yes')
         sys.exit(0)
 print('no')
-" "$PIPELINE_DIR/task-manifest.json" 2>/dev/null || echo "no")
+" "$PIPELINE_DIR" "$PIPELINE_DIR/task-manifest.json" 2>/dev/null || echo "no")
 
   if [ "$NEEDS_SPLIT" = "yes" ]; then
     log "Ticket splitter — breaking down large tasks..."
