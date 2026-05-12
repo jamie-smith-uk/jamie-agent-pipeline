@@ -73,11 +73,21 @@ EOF
 }
 
 run_agent() {
-  local agent_id="$1" prompt="$2" output_file="$3"
+  local agent_id="$1" prompt="$2" output_file="$3" timeout_secs="${4:-0}"
   log "[$agent_id] Starting..."
 
-  opencode run --agent "$agent_id" "$prompt" > "$output_file" 2>&1
+  if [ "$timeout_secs" -gt 0 ] 2>/dev/null; then
+    timeout "$timeout_secs" opencode run --agent "$agent_id" "$prompt" > "$output_file" 2>&1
+  else
+    opencode run --agent "$agent_id" "$prompt" > "$output_file" 2>&1
+  fi
   local exit_code=$?
+
+  # exit code 124 = timeout — return it to the caller for graceful handling
+  if [ $exit_code -eq 124 ]; then
+    log "[$agent_id] TIMEOUT after ${timeout_secs}s"
+    return 124
+  fi
 
   if [ $exit_code -ne 0 ]; then
     halt "Agent invocation failed (exit $exit_code)" "$agent_id" "$(cat "$output_file")"
@@ -1466,7 +1476,19 @@ $PREV_DIFF
 </previous-attempt-diff>}"
       fi
 
-      run_agent "ag-04-developer" "$DEV_PROMPT" "$TASK_DIR/dev-output-$DEV_ATTEMPTS.md"
+      run_agent "ag-04-developer" "$DEV_PROMPT" "$TASK_DIR/dev-output-$DEV_ATTEMPTS.md" 1200
+      local dev_rc=$?
+
+      if [ $dev_rc -eq 124 ]; then
+        log "Developer attempt $DEV_ATTEMPTS timed out after 20 minutes — counting as gate failure"
+        GATE_FAILURES="=== Developer attempt timed out ===
+The agent did not complete within 20 minutes. This usually means the task is too large
+or the agent spent too long reading before writing. On your next attempt:
+- Write implementation code immediately — do not re-read files you already know
+- Focus only on files_in_scope; ignore everything else
+- Implement the minimum needed to make the failing tests pass"
+        continue
+      fi
 
       if [ -f "$TASK_DIR/BLOCKED.md" ]; then
         halt "Developer blocked on $TASK_ID" "AG-04" "$(cat "$TASK_DIR/BLOCKED.md")"
@@ -1882,7 +1904,7 @@ Fix everything before updating self-assessment.md.
 Use process.env.DATABASE_URL for any database connections."
 
       run_agent "ag-04-developer" "$SEC_FIX_PROMPT" \
-        "$TASK_DIR/dev-secfix-$SECURITY_ATTEMPTS.md"
+        "$TASK_DIR/dev-secfix-$SECURITY_ATTEMPTS.md" 900
 
       SCOPE_VIOLATIONS=$(check_scope_compliance "$FILES_IN_SCOPE_JSON") || true
       if [ -n "$SCOPE_VIOLATIONS" ]; then
@@ -2116,7 +2138,7 @@ Rules:
 Apply all security rules. Do not introduce new issues."
 
     run_agent "ag-04-developer" "$VAL_FIX_PROMPT" \
-      "$PIPELINE_DIR/val-fix-dev-$VALIDATION_ATTEMPTS.md"
+      "$PIPELINE_DIR/val-fix-dev-$VALIDATION_ATTEMPTS.md" 900
 
     # Re-run the full hard gate across all tasks so we know nothing regressed
     log "Re-running full hard gate after validation fix..."
