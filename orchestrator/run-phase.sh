@@ -1231,6 +1231,65 @@ with open('$PIPELINE_DIR/approval.json', 'w') as f:
 
 fi # end of SKIP_ARCHITECT != 1 block
 
+# ── Ticket splitter ───────────────────────────────────────────────────────────
+# Runs after the manifest is finalised (regardless of SKIP_ARCHITECT).
+# Splits any high-complexity or large-AC tasks into smaller sub-tasks.
+# Skips tasks that are already complete. No-ops if all tasks are already small.
+if [ ! -f "$PIPELINE_DIR/splitter-output.md" ]; then
+  COMPLETED_TASKS=$(python3 -c "
+import os, json, sys
+pipeline_dir = sys.argv[1]
+manifest_path = os.path.join(pipeline_dir, 'task-manifest.json')
+data = json.load(open(manifest_path))
+tasks = data if isinstance(data, list) else data.get('tasks', [])
+complete = []
+for t in tasks:
+    tid = t.get('id', '')
+    sec_report = os.path.join(pipeline_dir, tid, 'security-report.md')
+    if os.path.isfile(sec_report):
+        complete.append(tid)
+print(', '.join(complete) if complete else 'none')
+" "$PIPELINE_DIR" 2>/dev/null || echo "none")
+
+  NEEDS_SPLIT=$(python3 -c "
+import json, sys
+data = json.load(open(sys.argv[1]))
+tasks = data if isinstance(data, list) else data.get('tasks', [])
+for t in tasks:
+    c = t.get('estimated_complexity', '')
+    acs = len(t.get('acceptance_criteria', []))
+    files = len(t.get('files_in_scope', []))
+    if c == 'high' or acs > 4 or files > 3:
+        print('yes')
+        sys.exit(0)
+print('no')
+" "$PIPELINE_DIR/task-manifest.json" 2>/dev/null || echo "no")
+
+  if [ "$NEEDS_SPLIT" = "yes" ]; then
+    log "Ticket splitter — breaking down large tasks..."
+    SPLIT_PROMPT="You are AG-09 Ticket Splitter for {PROJECT_NAME}.
+
+Manifest path: $PIPELINE_DIR/task-manifest.json
+Pipeline directory: $PIPELINE_DIR
+Already-complete tasks (do NOT modify these): $COMPLETED_TASKS
+
+PRD summary:
+$(head -c 3000 "$PIPELINE_DIR/ag01-output.md" 2>/dev/null || echo "(no architect output)")
+
+Read task-manifest.json, split any tasks that exceed the thresholds defined in your
+system prompt, rewrite task-manifest.json in place, and write splitter-output.md to
+$PIPELINE_DIR/splitter-output.md."
+
+    run_agent "ag-09-splitter" "$SPLIT_PROMPT" "$PIPELINE_DIR/splitter-agent-log.md" 300
+    log "Ticket splitter complete"
+  else
+    log "Ticket splitter — all tasks already small, skipping"
+    echo "All tasks within size thresholds — no splitting needed." > "$PIPELINE_DIR/splitter-output.md"
+  fi
+else
+  log "Ticket splitter already ran — skipping"
+fi
+
 # ── Task loop ─────────────────────────────────────────────────────────────────
 TASKS=$(python3 -c "
 import json
