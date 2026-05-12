@@ -1273,20 +1273,53 @@ print('no')
 
   if [ "$NEEDS_SPLIT" = "yes" ]; then
     log "Ticket splitter — breaking down large tasks..."
+
+    # Write a filtered manifest containing ONLY incomplete tasks for the splitter.
+    # Complete tasks are never shown to the agent — it cannot rename or modify them.
+    # After the agent rewrites the filtered manifest, we merge the results back.
+    INCOMPLETE_MANIFEST="$PIPELINE_DIR/splitter-input.json"
+    COMPLETE_MANIFEST="$PIPELINE_DIR/splitter-complete-tasks.json"
+    python3 -c "
+import json, os, sys
+pipeline_dir, manifest_path = sys.argv[1], sys.argv[2]
+incomplete_out, complete_out = sys.argv[3], sys.argv[4]
+data = json.load(open(manifest_path))
+tasks = data if isinstance(data, list) else data.get('tasks', [])
+incomplete, complete = [], []
+for t in tasks:
+    sec = os.path.join(pipeline_dir, t.get('id',''), 'security-report.md')
+    (complete if os.path.isfile(sec) else incomplete).append(t)
+with open(incomplete_out, 'w') as f:
+    json.dump(incomplete, f, indent=2)
+with open(complete_out, 'w') as f:
+    json.dump(complete, f, indent=2)
+" "$PIPELINE_DIR" "$PIPELINE_DIR/task-manifest.json" \
+      "$INCOMPLETE_MANIFEST" "$COMPLETE_MANIFEST"
+
     SPLIT_PROMPT="You are AG-09 Ticket Splitter for {PROJECT_NAME}.
 
-Manifest path: $PIPELINE_DIR/task-manifest.json
+Your input manifest (incomplete tasks only): $INCOMPLETE_MANIFEST
 Pipeline directory: $PIPELINE_DIR
-Already-complete tasks (do NOT modify these): $COMPLETED_TASKS
 
 PRD summary:
 $(head -c 3000 "$PIPELINE_DIR/ag01-output.md" 2>/dev/null || echo "(no architect output)")
 
-Read task-manifest.json, split any tasks that exceed the thresholds defined in your
-system prompt, rewrite task-manifest.json in place, and write splitter-output.md to
-$PIPELINE_DIR/splitter-output.md."
+Read $INCOMPLETE_MANIFEST. Split any tasks that exceed the thresholds in your system
+prompt. Rewrite $INCOMPLETE_MANIFEST in place with the split tasks.
+Write splitter-output.md to $PIPELINE_DIR/splitter-output.md."
 
     run_agent "ag-09-splitter" "$SPLIT_PROMPT" "$PIPELINE_DIR/splitter-agent-log.md" 300
+
+    # Merge complete tasks back at the front of the manifest, split tasks at the end.
+    python3 -c "
+import json, sys
+complete_path, incomplete_path, manifest_path = sys.argv[1], sys.argv[2], sys.argv[3]
+complete = json.load(open(complete_path))
+incomplete = json.load(open(incomplete_path))
+with open(manifest_path, 'w') as f:
+    json.dump(complete + incomplete, f, indent=2)
+" "$COMPLETE_MANIFEST" "$INCOMPLETE_MANIFEST" "$PIPELINE_DIR/task-manifest.json"
+
     log "Ticket splitter complete"
   else
     log "Ticket splitter — all tasks already small, skipping"
