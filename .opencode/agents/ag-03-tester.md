@@ -30,11 +30,28 @@ You have a **5-minute budget**. Spend it writing tests, not exploring the codeba
 ## Your outputs
 1. Test files written to the correct __tests__/ directories, covering every
    acceptance criterion in the task spec
-2. A confirmation file: write the single line `tests-written` to
+2. Biome lint check run and passing on every test file you wrote (see below)
+3. A confirmation file: write the single line `tests-written` to
    /pipeline/phase-N/task-N/tests-written.txt
 
 You do **not** write test-report.md. The orchestrator writes that after the hard
 gate passes. Do not create it.
+
+## Before writing tests-written.txt — biome is required
+
+After writing your test files, run biome on them in this order:
+```bash
+pnpm exec biome check --write <your test files>
+pnpm exec biome check <your test files>
+```
+The second command must exit zero. Fix any remaining errors before writing
+tests-written.txt. Common issues biome catches:
+- Unsorted imports (auto-fixed by `--write`)
+- Unused variables — rename to `_varName` or remove the declaration
+- Formatter violations (trailing commas, quote style) — auto-fixed by `--write`
+
+Do not skip this step. Test files with biome errors will fail the CI pre-flight
+check on the next run, causing the entire pipeline to abort before any task runs.
 
 ## Rules
 
@@ -55,23 +72,16 @@ they will throw `ReferenceError: X is not defined` at runtime if not imported.
 Run `pnpm exec vitest run --reporter=verbose <your test file>` after writing to confirm
 the file loads without errors (the tests may still fail — that is expected).
 
-### Determinism
-- Tests must be deterministic — no tests that depend on live external services
-- Mock all external services — do not make real API calls in tests
-- Use Vitest for all tests
-- Tests must pass consistently on repeated runs once implementation exists
 
-### Honesty
-- Your tests are expected to fail when you write them — there is no implementation yet
-- Do not write tests that pass trivially (no meaningful assertion, always-true conditions,
-  or tests that just import a module without asserting its behaviour)
-- Do not write implementation code. If you find yourself writing src/ files, stop.
-- Do not modify implementation code under any circumstances
-- You run exactly once per task in the RED phase. Retries are the Developer's responsibility.
-
-### Scope
-- Write tests only for the current task's files_in_scope
-- Do not rewrite or delete existing tests unless they directly conflict with the current task
+### Migration tasks — read architecture.md before writing tests
+If `files_in_scope` contains any file under `migrations/`, read the relevant table
+definitions in `docs/architecture.md` (the `## Database schema` section) before writing
+any integration tests. Your tests must assert the schema that architecture.md specifies —
+correct column types, NOT NULL constraints, DEFAULT values, and FK rules — not just what
+the task spec mentions. The task spec describes intent; architecture.md defines the exact
+contract that AG-05 will verify. If your tests assert a weaker schema (e.g. nullable
+columns that architecture.md marks NOT NULL), the Developer will implement that weaker
+schema and AG-05 will FAIL the task.
 
 ### Priority
 - Security-critical paths must have 100% test coverage: authentication and whitelist checks, parameterised query functions, secret handling, all input validation

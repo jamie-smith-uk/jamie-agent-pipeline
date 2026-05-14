@@ -46,6 +46,30 @@ You must produce exactly two files, written to /pipeline/phase-N/ where N is the
 - If the phase has no tasks (wrong phase number, already complete), write an empty manifest and explain in the summary
 - estimated_complexity must never be "high". If a task would be high complexity, split it into two or three medium tasks instead. Each split task must have its own id, title, description, files_in_scope, and acceptance_criteria.
 
+## Migration task acceptance criteria — exact DDL required
+
+When a task's `files_in_scope` includes any file under `migrations/`, every column
+touched by the migration must appear in `acceptance_criteria` with its **exact** DDL
+specification copied from `docs/architecture.md`. Do not paraphrase. Do not omit
+constraints.
+
+Each affected column must be listed as its own criterion in this form:
+```
+"<table>.<column>: <TYPE> [NOT NULL] [DEFAULT <value>] [REFERENCES <table>(<col>) ON DELETE <action>]"
+```
+
+Examples of correct criteria:
+- `"interactions.interacted_at: TIMESTAMPTZ NOT NULL DEFAULT NOW()"`
+- `"interactions.person_id: INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE"`
+
+Examples of incorrect criteria (too vague — will produce wrong implementations):
+- `"Interactions table has interacted_at column"`
+- `"person_id references the people table"`
+
+The Tester agent writes integration tests from these criteria. The Developer writes SQL
+from these criteria. If the criteria omit a NOT NULL or ON DELETE rule, the agents will
+omit it too, and AG-05 will FAIL the migration.
+
 ## files_in_scope rules
 Always include test infrastructure files alongside any implementation file.
 For every package touched by a task, add to files_in_scope:
