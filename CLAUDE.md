@@ -6,7 +6,7 @@ A reusable AI agent pipeline for building software projects. This is the **templ
 
     .opencode/agents/    agent system prompts (ag-01 through ag-08, numbered in execution order)
     .opencode/rules/     opencode rules loaded every session (security, typescript)
-    orchestrator/        run-phase.sh, run-task.sh, setup-pipeline.sh, sync-pipeline.sh, check-pipeline.sh
+    orchestrator/        approve.sh, setup-pipeline.sh, sync-pipeline.sh
     orchestrator/src/    TypeScript orchestrator (index.ts, phases/, checks/)
     docs/templates/      PRD, architecture, env, and smoke test templates for new projects
     docs/                pipeline documentation (best-practices.md)
@@ -23,7 +23,7 @@ Use `{PROJECT_NAME}` and `{project-name}` as placeholders in all agent files and
 
 **Updating an agent:** edit `.opencode/agents/ag-XX-name.md` directly. Keep prompts focused — one role, clear scope, explicit escape hatches (BLOCKED.md). Critical rules go at the start.
 
-**Updating orchestrator scripts:** edit `orchestrator/run-phase.sh` or supporting scripts. The same placeholder rules apply. Use `python3` for JSON and text manipulation (avoids jq dependency).
+**Updating orchestrator scripts:** edit files in `orchestrator/src/`. Shell scripts (`approve.sh`, `setup-pipeline.sh`, `sync-pipeline.sh`) handle setup and human gates only. Use `python3` for JSON and text manipulation in shell scripts (avoids jq dependency).
 
 **Updating the TypeScript orchestrator:** edit files in `orchestrator/src/`. The canonical entry point is `orchestrator/src/index.ts`; phases are in `orchestrator/src/phases/` and quality checks in `orchestrator/src/checks/`. Apply the same `{PROJECT_NAME}` / `{project-name}` placeholder rules — no hardcoded project names in any `.ts` file.
 
@@ -36,7 +36,7 @@ Use `{PROJECT_NAME}` and `{project-name}` as placeholders in all agent files and
 - Commit messages: `feat(v1.X): ...` / `fix(vY.Z): ...` for pipeline improvements
 - Agent report titles must follow the exact pattern `Title: ... — PASS` or `Title: ... — FAIL` — the orchestrator's `report_passes()` matches on this
 - Metrics: `pipeline/phase-N/metrics.json` — high retry counts signal spec or prompt gaps
-- Context cap: `CONTEXT_MAX_CHARS=4000` in run-phase.sh controls how much context.md is injected
+- Context cap: `CONTEXT_MAX_CHARS=4000` in `orchestrator/src/context.ts` controls how much context.md is injected
 
 ## Running locally
 

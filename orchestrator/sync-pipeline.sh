@@ -81,7 +81,7 @@ echo "Will update:"
 echo "  .opencode/agents/*.md        → target/.opencode/agents/"
 echo "  .opencode/config.json        → target/.opencode/config.json"
 echo "  .opencode/rules/*.md         → target/.opencode/rules/"
-echo "  orchestrator/*.sh            → target/orchestrator/ (executable)"
+echo "  orchestrator/approve.sh      → target/orchestrator/ (executable)"
 echo "  orchestrator/src/*.ts        → target/orchestrator/src/ (TypeScript orchestrator)"
 echo "  .github/workflows/*.yml      → target/.github/workflows/"
 echo ""
@@ -128,7 +128,7 @@ log "  → .opencode/rules/typescript.md"
 log "Syncing orchestrator scripts..."
 mkdir -p "$TARGET/orchestrator"
 
-for script in run-phase.sh run-task.sh check-pipeline.sh approve.sh; do
+for script in approve.sh; do
   substitute "$PIPELINE_REPO/orchestrator/$script" "$TARGET/orchestrator/$script"
   chmod +x "$TARGET/orchestrator/$script"
   log "  → orchestrator/$script"
