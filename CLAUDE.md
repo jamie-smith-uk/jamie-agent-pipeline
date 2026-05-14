@@ -7,6 +7,7 @@ A reusable AI agent pipeline for building software projects. This is the **templ
     .opencode/agents/    agent system prompts (ag-01 through ag-08, numbered in execution order)
     .opencode/rules/     opencode rules loaded every session (security, typescript)
     orchestrator/        run-phase.sh, run-task.sh, setup-pipeline.sh, sync-pipeline.sh, check-pipeline.sh
+    orchestrator/src/    TypeScript orchestrator (index.ts, phases/, checks/)
     docs/templates/      PRD, architecture, env, and smoke test templates for new projects
     docs/                pipeline documentation (best-practices.md)
 
@@ -24,6 +25,8 @@ Use `{PROJECT_NAME}` and `{project-name}` as placeholders in all agent files and
 
 **Updating orchestrator scripts:** edit `orchestrator/run-phase.sh` or supporting scripts. The same placeholder rules apply. Use `python3` for JSON and text manipulation (avoids jq dependency).
 
+**Updating the TypeScript orchestrator:** edit files in `orchestrator/src/`. The canonical entry point is `orchestrator/src/index.ts`; phases are in `orchestrator/src/phases/` and quality checks in `orchestrator/src/checks/`. Apply the same `{PROJECT_NAME}` / `{project-name}` placeholder rules — no hardcoded project names in any `.ts` file.
+
 **Propagating to deployed projects:** `./orchestrator/sync-pipeline.sh --target /path/to/project`
 
 ## Key conventions
@@ -37,4 +40,13 @@ Use `{PROJECT_NAME}` and `{project-name}` as placeholders in all agent files and
 
 ## Running locally
 
-Requires: opencode CLI, Anthropic API key. See `docs/best-practices.md` for design rationale.
+Requires: opencode CLI, Anthropic API key, Node.js 20+, pnpm. See `docs/best-practices.md` for design rationale.
+
+```bash
+# Run a full pipeline phase (TypeScript orchestrator — canonical)
+pnpm exec tsx orchestrator/src/index.ts --phase 1
+
+# Run a single ad-hoc task
+pnpm exec tsx orchestrator/src/run-task.ts backlog/my-task.md
+pnpm exec tsx orchestrator/src/run-task.ts --quick "Fix the crash in handler"
+```

@@ -18,11 +18,26 @@ concurrency:
 
 jobs:
   architect:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
 
     env:
       PHASE: ${{ github.event.inputs.phase }}
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: {project-name}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: {project-name}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 15
 
     steps:
       - name: Checkout
@@ -58,13 +73,17 @@ jobs:
       - name: Add opencode to PATH
         run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
 
-      - name: Make scripts executable
-        run: chmod +x orchestrator/*.sh
-
       - name: Run AG-01 Architect + AG-02 Reviewer
-        run: ARCHITECT_ONLY=1 ./orchestrator/run-phase.sh --phase "$PHASE"
+        run: ARCHITECT_ONLY=1 pnpm exec tsx orchestrator/src/index.ts --phase "$PHASE"
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          POSTGRES_USER: {project-name}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: {project-name}
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+          DATABASE_URL: postgresql://{project-name}:${{ secrets.POSTGRES_PASSWORD }}@localhost:5432/{project-name}
+          # Add project-specific secrets and env vars here
 
       - name: Dump debug info on failure
         if: failure()

@@ -77,6 +77,58 @@ for script in run-phase.sh run-task.sh check-pipeline.sh approve.sh; do
   chmod +x "$TARGET/orchestrator/$script"
 done
 
+# ── Copy TypeScript orchestrator source ───────────────────────────────────────
+log "Copying TypeScript orchestrator source..."
+mkdir -p \
+  "$TARGET/orchestrator/src/checks" \
+  "$TARGET/orchestrator/src/phases"
+
+for ts_file in "$PIPELINE_REPO"/orchestrator/src/*.ts; do
+  filename="$(basename "$ts_file")"
+  substitute "$ts_file" "$TARGET/orchestrator/src/$filename"
+  log "  → orchestrator/src/$filename"
+done
+
+for ts_file in "$PIPELINE_REPO"/orchestrator/src/checks/*.ts; do
+  filename="$(basename "$ts_file")"
+  substitute "$ts_file" "$TARGET/orchestrator/src/checks/$filename"
+  log "  → orchestrator/src/checks/$filename"
+done
+
+for ts_file in "$PIPELINE_REPO"/orchestrator/src/phases/*.ts; do
+  filename="$(basename "$ts_file")"
+  substitute "$ts_file" "$TARGET/orchestrator/src/phases/$filename"
+  log "  → orchestrator/src/phases/$filename"
+done
+
+# Copy orchestrator package.json and tsconfig.json
+substitute "$PIPELINE_REPO/orchestrator/package.json" "$TARGET/orchestrator/package.json"
+log "  → orchestrator/package.json"
+
+cp "$PIPELINE_REPO/orchestrator/tsconfig.json" "$TARGET/orchestrator/tsconfig.json"
+log "  → orchestrator/tsconfig.json"
+
+# Create or update pnpm-workspace.yaml to include orchestrator
+WORKSPACE_FILE="$TARGET/pnpm-workspace.yaml"
+if [ ! -f "$WORKSPACE_FILE" ]; then
+  log "Creating pnpm-workspace.yaml..."
+  cat > "$WORKSPACE_FILE" <<'EOF'
+packages:
+  - "orchestrator"
+  # Add your project packages here, e.g.:
+  # - "packages/*"
+EOF
+elif ! grep -q '"orchestrator"' "$WORKSPACE_FILE" && ! grep -q "- \"orchestrator\"" "$WORKSPACE_FILE" && ! grep -q "- 'orchestrator'" "$WORKSPACE_FILE" && ! grep -q "^  - orchestrator$" "$WORKSPACE_FILE"; then
+  log "Adding orchestrator to existing pnpm-workspace.yaml..."
+  echo '  - "orchestrator"' >> "$WORKSPACE_FILE"
+else
+  log "pnpm-workspace.yaml already includes orchestrator — skipping"
+fi
+
+# Install dependencies
+log "Running pnpm install..."
+pnpm install --dir "$TARGET"
+
 mkdir -p "$TARGET/backlog"
 cp "$PIPELINE_REPO/backlog/README.md" "$TARGET/backlog/README.md" 2>/dev/null || true
 
@@ -212,5 +264,5 @@ if [ ! -f "$TARGET/docs/architecture.md" ]; then
 else
   echo "  4. Fill in docs/architecture.md with your architecture decisions"
 fi
-echo "  5. Run: ./orchestrator/run-phase.sh --phase 1"
+echo "  5. Run: pnpm exec tsx orchestrator/src/index.ts --phase 1"
 echo ""

@@ -82,6 +82,7 @@ echo "  .opencode/agents/*.md        → target/.opencode/agents/"
 echo "  .opencode/config.json        → target/.opencode/config.json"
 echo "  .opencode/rules/*.md         → target/.opencode/rules/"
 echo "  orchestrator/*.sh            → target/orchestrator/ (executable)"
+echo "  orchestrator/src/*.ts        → target/orchestrator/src/ (TypeScript orchestrator)"
 echo "  .github/workflows/*.yml      → target/.github/workflows/"
 echo ""
 echo "Will NOT touch:"
@@ -132,6 +133,36 @@ for script in run-phase.sh run-task.sh check-pipeline.sh approve.sh; do
   chmod +x "$TARGET/orchestrator/$script"
   log "  → orchestrator/$script"
 done
+
+# ── Sync TypeScript orchestrator source ───────────────────────────────────────
+log "Syncing TypeScript orchestrator source..."
+mkdir -p \
+  "$TARGET/orchestrator/src/checks" \
+  "$TARGET/orchestrator/src/phases"
+
+for ts_file in "$PIPELINE_REPO"/orchestrator/src/*.ts; do
+  filename="$(basename "$ts_file")"
+  substitute "$ts_file" "$TARGET/orchestrator/src/$filename"
+  log "  → orchestrator/src/$filename"
+done
+
+for ts_file in "$PIPELINE_REPO"/orchestrator/src/checks/*.ts; do
+  filename="$(basename "$ts_file")"
+  substitute "$ts_file" "$TARGET/orchestrator/src/checks/$filename"
+  log "  → orchestrator/src/checks/$filename"
+done
+
+for ts_file in "$PIPELINE_REPO"/orchestrator/src/phases/*.ts; do
+  filename="$(basename "$ts_file")"
+  substitute "$ts_file" "$TARGET/orchestrator/src/phases/$filename"
+  log "  → orchestrator/src/phases/$filename"
+done
+
+substitute "$PIPELINE_REPO/orchestrator/package.json" "$TARGET/orchestrator/package.json"
+log "  → orchestrator/package.json"
+
+cp "$PIPELINE_REPO/orchestrator/tsconfig.json" "$TARGET/orchestrator/tsconfig.json"
+log "  → orchestrator/tsconfig.json"
 
 # ── Sync GitHub Actions workflows ────────────────────────────────────────────
 if [ -d "$PIPELINE_REPO/.github/workflows" ]; then

@@ -1,0 +1,4 @@
+packages:
+  - "orchestrator"
+  # Add your project packages here, e.g.:
+  # - "packages/*"
