@@ -34,13 +34,13 @@ export function tryFixer(
       // ignore
     }
 
-    // Collect all available gate failure history
-    let gateFailuresHistory = "";
+    // List gate failure files (don't inline — avoids E2BIG on large histories)
+    const gateFailureFiles: string[] = [];
     let i = 1;
     while (true) {
       const gf = path.join(taskDir, `gate-failures-${i}.txt`);
       if (!fs.existsSync(gf)) break;
-      gateFailuresHistory += `\n=== gate-failures-${i}.txt ===\n${fs.readFileSync(gf, "utf8")}\n`;
+      gateFailureFiles.push(gf);
       i++;
     }
 
@@ -49,13 +49,7 @@ export function tryFixer(
     const filesBulletList = filesInScope.map((f) => `  - ${f}`).join("\n");
 
     const taskSpec = `<task-spec>\n${JSON.stringify(task, null, 2)}\n</task-spec>`;
-
-    let contextMd = "(context.md not yet written)";
-    try {
-      contextMd = fs.readFileSync(path.join(cfg.pipelineDir, "context.md"), "utf8");
-    } catch {
-      // ignore
-    }
+    const contextMdPath = path.join(cfg.pipelineDir, "context.md");
 
     const fixerPrompt = `GATE FAILURE — Fixer invoked [attempt ${n}/${maxFixerAttempts}]
 
@@ -77,10 +71,12 @@ ${taskSpec}
 ${filesBulletList || "  (error reading scope)"}
 
 ## Prior gate failure history (all attempts before fixer was called)
-${gateFailuresHistory || "(none recorded)"}
+${gateFailureFiles.length > 0
+  ? `Read these files for the full history:\n${gateFailureFiles.map((f) => `  - ${f}`).join("\n")}`
+  : "(none recorded)"}
 
 ## Context from completed tasks in this phase
-${contextMd}
+See: ${contextMdPath}
 
 ## Key reference files — read these before diagnosing
 The following files contain the full design context. Read them all:
