@@ -19,7 +19,7 @@ import type { PipelineConfig, Task } from "../types.js";
 // ── runDeveloperPhase() ───────────────────────────────────────────────────────
 
 /**
- * GREEN phase: Developer implements until hard gate passes (up to 5 attempts + fixer).
+ * GREEN phase: Developer implements until hard gate passes (up to 3 attempts + fixer).
  */
 export function runDeveloperPhase(
   cfg: PipelineConfig,
@@ -59,9 +59,9 @@ export function runDeveloperPhase(
 
   const baselineFile = path.join(taskDir, "baseline-failures.txt");
 
-  while (!greenPassed && devAttempts < 5) {
+  while (!greenPassed && devAttempts < 3) {
     devAttempts++;
-    log(`GREEN phase — Developer attempt ${devAttempts}/5...`);
+    log(`GREEN phase — Developer attempt ${devAttempts}/3...`);
 
     let devPrompt = baseDevPrompt;
 
@@ -207,13 +207,13 @@ or the agent spent too long reading before writing. On your next attempt:
 
       log("GREEN phase: PASS");
     } else {
-      log(`Hard gate: FAIL (attempt ${devAttempts}/5)`);
+      log(`Hard gate: FAIL (attempt ${devAttempts}/3)`);
       fs.writeFileSync(
         path.join(taskDir, `gate-failures-${devAttempts}.txt`),
         gateFailures,
       );
 
-      if (devAttempts === 5) {
+      if (devAttempts === 3) {
         // Collect all gate failures for fixer
         let allGateFailures = "";
         try {
@@ -226,7 +226,7 @@ or the agent spent too long reading before writing. On your next attempt:
         }
         try {
           allGateFailures += "\n" + fs.readFileSync(
-            path.join(taskDir, "gate-failures-5.txt"),
+            path.join(taskDir, "gate-failures-3.txt"),
             "utf8",
           );
         } catch {
@@ -237,7 +237,7 @@ or the agent spent too long reading before writing. On your next attempt:
           cfg,
           task,
           taskDir,
-          "Developer could not pass hard gate after 5 attempts",
+          "Developer could not pass hard gate after 3 attempts",
           "AG-04",
           allGateFailures,
           filesInScopeJson,
